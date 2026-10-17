@@ -1186,6 +1186,7 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
             tools=tools,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
@@ -1202,6 +1203,67 @@ class BatchedEngine(BaseEngine):
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
+        )
+
+    def _stream_request_arguments(
+        self,
+        prompt,
+        max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        repetition_penalty,
+        presence_penalty,
+        stop,
+        kwargs,
+    ) -> dict[str, Any]:
+        """stream_generate's SamplingParams and add_request arguments.
+
+        Shared with owned admission so both build the same request. Pops from
+        ``kwargs`` exactly as stream_generate always did.
+        """
+        from ..request import SamplingParams
+
+        self._prepare_k2_tool_grammar(kwargs.get("tools"), kwargs)
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            xtc_probability=kwargs.get("xtc_probability", 0.0),
+            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
+            repetition_penalty=repetition_penalty,
+            repetition_context_size=kwargs.get("repetition_context_size"),
+            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
+            ngram_window=kwargs.get("ngram_window", 0),
+            presence_penalty=presence_penalty,
+            frequency_penalty=kwargs.get("frequency_penalty", 0.0),
+            stop=stop or [],
+            thinking_budget=kwargs.get("thinking_budget", None),
+            compiled_grammar=kwargs.get("compiled_grammar", None),
+            seed=kwargs.get("seed", None),
+            stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
+            logits_observer=kwargs.get("logits_observer"),
+        )
+
+        # SpecPrefill: pass per-request overrides to engine
+        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
+
+        return dict(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
+            tools=tools,
+            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
+            benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
+            benchmark_ane_sequence_length=int(
+                kwargs.get("benchmark_ane_sequence_length", 0) or 0
+            ),
+            **specprefill_kwargs,
         )
 
     async def stream_generate(
@@ -1238,49 +1300,20 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        from ..request import SamplingParams
-
-        self._prepare_k2_tool_grammar(kwargs.get("tools"), kwargs)
-        sampling_params = SamplingParams(
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            xtc_probability=kwargs.get("xtc_probability", 0.0),
-            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
-            repetition_penalty=repetition_penalty,
-            repetition_context_size=kwargs.get("repetition_context_size"),
-            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
-            ngram_window=kwargs.get("ngram_window", 0),
-            presence_penalty=presence_penalty,
-            frequency_penalty=kwargs.get("frequency_penalty", 0.0),
-            stop=stop or [],
-            thinking_budget=kwargs.get("thinking_budget", None),
-            compiled_grammar=kwargs.get("compiled_grammar", None),
-            seed=kwargs.get("seed", None),
-            stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
-            logits_observer=kwargs.get("logits_observer"),
+        arguments = self._stream_request_arguments(
+            prompt,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            presence_penalty,
+            stop,
+            kwargs,
         )
-
-        # SpecPrefill: pass per-request overrides to engine
-        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
-        tools = kwargs.pop("tools", None)
-
         engine = self._engine
-        request_id = await engine.add_request(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=kwargs.pop("_request_id", None),
-            tools=tools,
-            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
-            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
-            benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
-            benchmark_ane_sequence_length=int(
-                kwargs.get("benchmark_ane_sequence_length", 0) or 0
-            ),
-            **specprefill_kwargs,
-        )
+        request_id = await engine.add_request(**arguments)
 
         finished_normally = False
         try:
@@ -1504,40 +1537,12 @@ class BatchedEngine(BaseEngine):
             scheduler, num_prompt_tokens=num_tokens, request_id=request_id
         )
 
-    async def stream_chat(
-        self,
-        messages: list[dict[str, Any]],
-        max_tokens: int = 256,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
-        top_k: int = 0,
-        min_p: float = 0.0,
-        repetition_penalty: float = 1.0,
-        presence_penalty: float = 0.0,
-        tools: list[dict] | None = None,
-        **kwargs,
-    ) -> AsyncIterator[GenerationOutput]:
+    def _stream_chat_prompt(self, messages, tools, kwargs):
+        """stream_chat's prompt, as passed to stream_generate.
+
+        Shared with owned admission. Mutates ``kwargs`` exactly as stream_chat
+        always did (template kwargs popped, generation-prompt text set).
         """
-        Stream chat completion token by token.
-
-        Args:
-            messages: List of chat messages
-            max_tokens: Maximum tokens to generate
-            temperature: Sampling temperature
-            top_p: Top-p sampling
-            top_k: Top-k sampling (0 = disabled)
-            min_p: Min-p sampling (0.0 = disabled)
-            repetition_penalty: Repetition penalty (1.0 = disabled)
-            presence_penalty: Presence penalty (0.0 = disabled)
-            tools: Optional tool definitions
-            **kwargs: Additional model-specific parameters
-
-        Yields:
-            GenerationOutput with incremental text
-        """
-        if not self._loaded:
-            await self.start()
-
         # Preprocess messages for Harmony (gpt-oss) models
         messages = self._preprocess_messages(messages)
 
@@ -1572,9 +1577,97 @@ class BatchedEngine(BaseEngine):
         if generation_prompt:
             kwargs["generation_prompt_text"] = generation_prompt
             kwargs["generation_prompt_persists"] = persists
+        return prepared[1] if prepared is not None else prompt
+
+    async def admit_owned_chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        admission,
+        request_id: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
+        tools: list[dict] | None = None,
+        **kwargs,
+    ) -> None:
+        """Owned admission with exactly stream_chat's request.
+
+        The prompt, sampling parameters and add_request arguments come from
+        the helpers stream_chat and stream_generate use; the request is
+        admitted through the trusted handle under the claim's request ID.
+        Returns when admission returns. Never aborts and attaches no output
+        reader: the control coordinator owns the request from here.
+        """
+        if not self._loaded:
+            raise RuntimeError("owned_admission_engine_not_loaded")
+        # stream_chat would reject these by name; never drop them silently.
+        clash = sorted({"prompt"} & kwargs.keys())
+        if clash:
+            raise TypeError(f"owned_admission_unexpected_arguments: {clash}")
+        prompt = self._stream_chat_prompt(messages, tools, kwargs)
+        # stream_chat hands these to stream_generate as keywords.
+        stop = kwargs.pop("stop", None)
+        kwargs["tools"] = tools
+        arguments = self._stream_request_arguments(
+            prompt,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            presence_penalty,
+            stop,
+            kwargs,
+        )
+        if arguments["request_id"] is not None:
+            raise ValueError("owned_admission_request_id_conflict")
+        arguments["request_id"] = request_id
+        await self._engine.add_request(**arguments, _owned_admission=admission)
+
+    async def stream_chat(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
+        tools: list[dict] | None = None,
+        **kwargs,
+    ) -> AsyncIterator[GenerationOutput]:
+        """
+        Stream chat completion token by token.
+
+        Args:
+            messages: List of chat messages
+            max_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Top-p sampling
+            top_k: Top-k sampling (0 = disabled)
+            min_p: Min-p sampling (0.0 = disabled)
+            repetition_penalty: Repetition penalty (1.0 = disabled)
+            presence_penalty: Presence penalty (0.0 = disabled)
+            tools: Optional tool definitions
+            **kwargs: Additional model-specific parameters
+
+        Yields:
+            GenerationOutput with incremental text
+        """
+        if not self._loaded:
+            await self.start()
+
+        prompt = self._stream_chat_prompt(messages, tools, kwargs)
 
         async for output in self.stream_generate(
-            prompt=prepared[1] if prepared is not None else prompt,
+            prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,

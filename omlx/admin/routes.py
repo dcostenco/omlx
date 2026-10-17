@@ -366,6 +366,7 @@ class ModelSettingsRequest(BaseModel):
     preserve_thinking: bool | None = None
     cache_reasoning_output: bool | None = None
     qwen4_ple_ssd_offload: bool | None = None
+    qwen4_ple_gather_ahead: bool | None = None
     qwen4_gdn_decode_wide_proj: bool | None = None
     deepseek_v41_engram_ssd_offload: bool | None = None
     deepseek_v41_ced_prefill_enabled: bool | None = None
@@ -2838,6 +2839,14 @@ async def update_model_settings(
         ).lower() == "qwen4_exp"
         current_settings.qwen4_ple_ssd_offload = bool(
             request.qwen4_ple_ssd_offload and is_qwen4_exp
+        )
+    if "qwen4_ple_gather_ahead" in sent:
+        is_qwen4_exp = (entry.config_model_type or "").replace(
+            "-", "_"
+        ).lower() == "qwen4_exp"
+        # Off only when asked for on a Qwen4-Exp model; the default stays on.
+        current_settings.qwen4_ple_gather_ahead = not (
+            is_qwen4_exp and request.qwen4_ple_gather_ahead is False
         )
     if "qwen4_gdn_decode_wide_proj" in sent:
         is_qwen4_exp = (entry.config_model_type or "").replace(

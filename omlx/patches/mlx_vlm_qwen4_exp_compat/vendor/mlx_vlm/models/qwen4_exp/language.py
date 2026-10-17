@@ -28,6 +28,7 @@ from omlx.memory_monitor import (
     qwen4_text_mrope_broadcast as _broadcast_text_mrope_position_ids,
 )
 
+from omlx.host_submit import submit_tracked
 from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
 from omlx.patches import row_exact_qmv
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
@@ -60,6 +61,8 @@ logger = logging.getLogger(__name__)
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
+# Captured by each SSD-backed table at construction (see configure_ple_runtime).
+_PLE_RUNTIME_GATHER_AHEAD = True
 _HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
 
 
@@ -162,10 +165,17 @@ def resolve_ple_runtime_mode(
     return "mmap" if checkpoint_bytes > physical_memory * 0.70 else "resident"
 
 
-def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> str:
-    """Bind same-directory PLE storage before Qwen4 model construction."""
-    global _PLE_RUNTIME_MODEL_PATH, _PLE_RUNTIME_MODE
+def configure_ple_runtime(
+    model_path: str | Path, mode: str | None = None, *, gather_ahead: bool = True
+) -> str:
+    """Bind same-directory PLE storage before Qwen4 model construction.
 
+    ``gather_ahead=False`` builds SSD-backed tables that never start a
+    gather-ahead job: every row is read inside the forward that uses it.
+    """
+    global _PLE_RUNTIME_MODEL_PATH, _PLE_RUNTIME_MODE, _PLE_RUNTIME_GATHER_AHEAD
+
+    _PLE_RUNTIME_GATHER_AHEAD = bool(gather_ahead)
     compute_path = Path(model_path).expanduser().resolve()
     requested = mode or "auto"
     checkpoint_bytes = sum(
@@ -3360,7 +3370,7 @@ class _SafeTensorMMap:
             # Preserve page-read parallelism without one Future per page.
             task_count = min(fresh.size, _PLE_IO_WORKERS)
             for index in range(task_count):
-                futures.append(_PLE_IO_POOL.submit(touch, fresh[index::task_count]))
+                futures.append(submit_tracked(_PLE_IO_POOL, touch, fresh[index::task_count]))
             for future in futures:
                 future.result()
         finally:
@@ -3414,6 +3424,11 @@ class _SafeTensorMMap:
 class DiskBackedShardedEmbedding(nn.Module):
     """The 128-way dense or oQ-affine PLE table, gathered from SSD mmap."""
 
+    # The construction defaults (see __init__), also for a table built
+    # without it.
+    gather_ahead = True
+    prefetch_submissions = 0
+
     def __init__(
         self,
         model_path: str | Path,
@@ -3442,6 +3457,10 @@ class DiskBackedShardedEmbedding(nn.Module):
         self._pending: dict[bytes, tuple] = {}
         self._prefetch_lock = Lock()
         self._prefetch_closed = False
+        # Fixed at construction; owned work requires it off (no host job can
+        # outlive the forward that needs the rows).
+        self.gather_ahead = _PLE_RUNTIME_GATHER_AHEAD
+        self.prefetch_submissions = 0
         self._prefetch_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="ple-prefetch"
         )
@@ -3627,6 +3646,9 @@ class DiskBackedShardedEmbedding(nn.Module):
 
     def prefetch(self, indices: mx.array) -> None:
         """Assemble a chunk's rows on the prefetch worker; a later call with the same indices consumes them."""
+        # Every gather-ahead producer ends here, so this one gate covers them all.
+        if not self.gather_ahead:
+            return
         host = self._host_indices(indices)
         if host.size == 0:
             return
@@ -3643,9 +3665,10 @@ class DiskBackedShardedEmbedding(nn.Module):
             while len(self._pending) >= 2:
                 _, future = self._pending.pop(next(iter(self._pending)))
                 future.cancel()
+            self.prefetch_submissions += 1
             self._pending[key] = (
                 plan,
-                self._prefetch_executor.submit(self._assemble, host, plan),
+                submit_tracked(self._prefetch_executor, self._assemble, host, plan),
             )
 
     def __call__(self, indices: mx.array) -> mx.array:
@@ -4712,7 +4735,10 @@ class LanguageModel(Qwen3_5LanguageModel):
         """True when an SSD-backed PLE table gathers rows one prefill chunk ahead."""
         for layer in self.model.layers:
             ple = getattr(layer, "ple", None)
-            if ple is not None and getattr(ple.ple_embedding.ngram_embedding, "prefetch", None) is not None:
+            if ple is None:
+                continue
+            table = ple.ple_embedding.ngram_embedding
+            if getattr(table, "prefetch", None) is not None and getattr(table, "gather_ahead", True):
                 return True
         return False
 
@@ -4723,7 +4749,11 @@ class LanguageModel(Qwen3_5LanguageModel):
             if ple is None:
                 continue
             embedding = ple.ple_embedding
-            if getattr(embedding.ngram_embedding, "prefetch", None) is None:
+            table = embedding.ngram_embedding
+            # 28: a table with gather-ahead off is skipped, as in
+            # ple_gathers_ahead(); its prefetch() would submit nothing, and
+            # the log below would claim gather-ahead is active.
+            if getattr(table, "prefetch", None) is None or not getattr(table, "gather_ahead", True):
                 continue
             fill = mx.full(
                 (current_ids.shape[0], embedding.context_len),

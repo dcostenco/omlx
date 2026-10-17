@@ -57,6 +57,7 @@ from .cache.paged_cache import PagedCacheManager
 from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from .decode_activity import get_decode_activity
+from .owned_admission import OwnedAdmission, RunningCleaned, WaitingCleaned
 from .exceptions import (
     PrefillMemoryExceededError,
     describe_ceiling_binding,
@@ -64,6 +65,7 @@ from .exceptions import (
 )
 from .patches.mlx_lm_mtp import prompt_priming as _mtp_priming
 from .patches.mlx_lm_mtp.batch_generator import _drafter_for as _block_drafter_for
+from .patches.mlx_lm_mtp.batch_generator import _model_mtp_decode_enabled
 from .patches.mlx_lm_mtp.batch_generator import interrupt_batch_timing
 from .patches.vlm_batch_kv_capacity import apply_batch_kv_capacity_patch
 from .prefill.packed import (
@@ -362,6 +364,24 @@ class _StopOutputState:
     search_start: int = 0  # Streaming detokenizer text.
     visible_start: int = 0  # Parser visible text.
     answer_token_start: int = 0  # Output token ids.
+
+
+@dataclass
+class _DeferredCleanupTracking:
+    """Executor-owned deferred cleanup facts; never a backend-stop receipt."""
+
+    request: Any
+    entry: tuple
+    state: str = "pending"
+
+
+@dataclass
+class _WaitingCleanupProof:
+    handle: Any
+    request: Any
+    generation_id: str
+    state: str = "pending"
+    fact: Any = None
 
 
 def _safe_sync_stream(stream=None):
@@ -2254,6 +2274,14 @@ class Scheduler:
         # at a time until they leave the scheduler.
         self._pending_memory_requeue = False
         self._memory_requeue_ids: set[str] = set()
+        # 28: error outputs of owned no-retry requests ended at a retry site
+        # with no output list of its own; the next step() publishes them.
+        # Written and drained on the inference thread only.
+        self._owned_no_retry_outputs: list[RequestOutput] = []
+        # 28: owned requests whose retirement could not be established (a
+        # snapshot cleanup or abort cleanup raised). Never "absent" to owned
+        # termination; ids are unique per execution, failures are rare.
+        self._owned_retirement_failures: set[str] = set()
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
@@ -2455,6 +2483,13 @@ class Scheduler:
         # to finish before batch_generator.remove() can safely run. Drained
         # at the start of every step.
         self._pending_async_removes: deque = deque()
+        self._tracked_deferred_cleanups: dict[str, _DeferredCleanupTracking] = {}
+        self._owned_waiting_cleanup_proofs: dict[str, _WaitingCleanupProof] = {}
+        # 25b.4: set when an exception leaves step(), cleared by a successful
+        # fail_all_requests(); owned cleanup refuses while it is set.
+        self._step_failed = False
+        # Request ids whose prefill eviction the event loop is still awaiting.
+        self._prefill_eviction_awaiting: set[str] = set()
         # Track in-flight store futures per request_id for lookup wait /
         # shutdown wait.
         self._inflight_store_futures: dict[str, concurrent.futures.Future] = {}
@@ -2885,6 +2920,94 @@ class Scheduler:
         except Exception as e:
             logger.warning("Async store_cache failed for %s: %s", request_id, e)
 
+    _MAX_TRACKED_DEFERRED_CLEANUPS = 1024
+
+    def _track_deferred_cleanup(self, request_id: str) -> _DeferredCleanupTracking:
+        """Arm one existing deferred entry, on the scheduler executor only."""
+        if request_id in self._tracked_deferred_cleanups:
+            raise ValueError("deferred_cleanup_already_tracked")
+        if len(self._tracked_deferred_cleanups) >= self._MAX_TRACKED_DEFERRED_CLEANUPS:
+            raise ValueError("deferred_cleanup_tracking_full")
+        request = self.requests.get(request_id)
+        entries = [e for e in self._pending_async_removes if e[1] == request_id]
+        if request is None or len(entries) != 1:
+            raise ValueError("deferred_cleanup_identity_unavailable")
+        entry = entries[0]
+        if (
+            entry[2] is None
+            or self._inflight_store_futures.get(request_id) is not entry[2]
+        ):
+            raise ValueError("deferred_cleanup_future_mismatch")
+        tracking = _DeferredCleanupTracking(request=request, entry=entry)
+        self._tracked_deferred_cleanups[request_id] = tracking
+        return tracking
+
+    def _untrack_deferred_cleanup(
+        self, request_id: str, tracking: _DeferredCleanupTracking
+    ) -> None:
+        """Release a successful fact only with its exact ownership token."""
+        if (
+            self._tracked_deferred_cleanups.get(request_id) is not tracking
+            or tracking.state != "cleaned"
+        ):
+            raise ValueError("deferred_cleanup_not_releasable")
+        del self._tracked_deferred_cleanups[request_id]
+
+    def _drain_tracked_deferred_cleanup(
+        self, entry: tuple, tracking: _DeferredCleanupTracking
+    ) -> bool:
+        """Retain failed entries; later completed ordinary entries may drain."""
+        if tracking.state == "failed":
+            return False
+        uid, request_id, future = entry
+        try:
+            if (
+                tracking.state != "pending"
+                or entry is not tracking.entry
+                or self.requests.get(request_id) is not tracking.request
+                or self._inflight_store_futures.get(request_id) is not future
+            ):
+                raise RuntimeError("deferred_cleanup_identity_changed")
+            if not future.done():
+                return False
+            if future.cancelled() or future.exception() is not None:
+                raise RuntimeError("deferred_cleanup_worker_failed")
+            if self._stream is None:
+                raise RuntimeError("deferred_cleanup_stream_unavailable")
+            # Unlike the legacy teardown helper, no missing-stream exception
+            # is tolerated. This runs on the engine's scheduler executor.
+            mx.synchronize(self._stream)
+            owns_uid = self.uid_to_request_id.get(uid) == request_id
+            if owns_uid:
+                self._remove_uid_from_active_batch(uid)
+                if hasattr(self.model, "unregister_rope_delta"):
+                    self.model.unregister_rope_delta(uid)
+                _unregister_uid_row(self.model, uid)
+            if self._boundary_snapshot_store is not None:
+                self._boundary_snapshot_store.cleanup_request(request_id, strict=True)
+            self._clear_request_admission_bookkeeping(request_id)
+            # No potentially failing cleanup remains after gate release.
+            if self._store_cache_gate is not None:
+                self._store_cache_gate.note_done()
+            if owns_uid:
+                del self.uid_to_request_id[uid]
+            # Upstream queues store-only entries with no batch row,
+            # (None, request_id, future); get() == None must not delete an
+            # absent mapping. Same guard as _drain_pending_async_removes.
+            if uid is not None and self.request_id_to_uid.get(request_id) == uid:
+                del self.request_id_to_uid[request_id]
+            self._inflight_store_futures.pop(request_id, None)
+            self._inflight_store_info.pop(request_id, None)
+            del self.requests[request_id]
+            tracking.request._extracted_cache = None
+            tracking.request.prompt_cache = None
+            tracking.state = "cleaned"
+            return True
+        except Exception:
+            tracking.state = "failed"
+            logger.warning("Tracked deferred cleanup failed for %s", request_id)
+            return False
+
     def _drain_pending_async_removes(self) -> bool:
         """Process deferred batch_generator.remove() calls from prior steps.
 
@@ -2899,7 +3022,15 @@ class Scheduler:
         drained = False
         pending: deque = deque()
         while self._pending_async_removes:
-            uid, request_id, future = self._pending_async_removes.popleft()
+            entry = self._pending_async_removes.popleft()
+            uid, request_id, future = entry
+            tracking = self._tracked_deferred_cleanups.get(request_id)
+            if tracking is not None:
+                if self._drain_tracked_deferred_cleanup(entry, tracking):
+                    drained = True
+                else:
+                    pending.append(entry)
+                continue
             if future is not None and not future.done():
                 # Worker still busy. Keep it for the next step, but continue
                 # scanning so later completed futures can release memory now.
@@ -2932,6 +3063,12 @@ class Scheduler:
                             uid,
                             e,
                         )
+                        # 28: the row may remain; owned no-retry termination
+                        # stays unresolved instead of proving absence.
+                        if self._owned_no_retry(self.requests.get(request_id)):
+                            self.__dict__.setdefault(
+                                "_owned_retirement_failures", set()
+                            ).add(request_id)
                     # Cleanup uid maps now that the slot is reclaimable.
                     _unregister_uid_row(self.model, uid)
                     del self.uid_to_request_id[uid]
@@ -5685,6 +5822,7 @@ class Scheduler:
             return None
 
         stalled_for = now - self._memory_admission_blocked_since
+        self._invalidate_owned_waiting(request)
         self.waiting.popleft()
         self._release_paged_cache_for_request(request_id)
         self.requests.pop(request_id, None)
@@ -5751,6 +5889,7 @@ class Scheduler:
             return None
 
         stalled_for = now - self._store_cache_admission_blocked_since
+        self._invalidate_owned_waiting(request)
         self.waiting.popleft()
         self._release_paged_cache_for_request(request_id)
         self.requests.pop(request_id, None)
@@ -7237,7 +7376,8 @@ class Scheduler:
             request = plan.state.request
             request.packed_prefill_excluded = True
             self._teardown_prefill_request(request.request_id)
-            if not memory_pressure:
+            # Owned no-retry work falls through to the error below (28).
+            if not memory_pressure and not Scheduler._owned_no_retry(request):
                 # Packing is off for this model now; no retry budget is spent.
                 self._requeue_prefill_retry(request)
                 continue
@@ -7372,6 +7512,10 @@ class Scheduler:
                 Scheduler._clear_cache(self)
                 continue
             except _PrefillEvictionNeeded as e:
+                if self._end_owned_without_retry(request, "prefill_eviction"):
+                    # 28: never held for an eviction, and none is published.
+                    Scheduler._clear_cache(self)
+                    continue
                 self._pending_prefill_eviction_request = e.request
                 still_prefilling.append(request)
                 still_prefilling.extend(pending_prefills[index + 1 :])
@@ -10330,6 +10474,10 @@ class Scheduler:
         return result
 
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
+        if self._owned_waiting_fenced(request):
+            self._invalidate_owned_waiting(request)
+            return self._OWNED_PREFIX_FENCED
+        self._invalidate_owned_waiting(request)
         if request.request_id in self._prefix_cache_prepared:
             return
 
@@ -11573,6 +11721,528 @@ class Scheduler:
             after / 1024**3,
         )
 
+    _MAX_OWNED_WAITING_PROOFS = 128
+    _OWNED_PREFIX_FENCED = object()
+
+    @staticmethod
+    def _invalidate_owned_waiting(request):
+        owned = getattr(request, "_prism_owned_admission", None)
+        if type(owned) is OwnedAdmission and owned.request is request:
+            with owned._lock:
+                owned._waiting_pristine = False
+
+    @staticmethod
+    def _mark_owned_started(request):
+        owned = getattr(request, "_prism_owned_admission", None)
+        if type(owned) is OwnedAdmission and owned.request is request:
+            with owned._lock:
+                owned._started = True
+
+    @staticmethod
+    def _owned_no_retry(request) -> bool:
+        """28: owned work that every retry site ends with an error instead.
+
+        Fixed on the handle before admission (a pressure family, Flash-Next):
+        no requeue, reschedule, memory requeue or eviction pause re-runs it.
+        """
+        owned = getattr(request, "_prism_owned_admission", None)
+        return type(owned) is OwnedAdmission and owned.retry is False
+
+    def _queue_owned_no_retry_output(self, request_id: str, reason: str) -> None:
+        """Publish an ended no-retry request's error at the next step()."""
+        self._owned_no_retry_outputs.append(
+            RequestOutput(
+                request_id=request_id,
+                finished=True,
+                finish_reason="error",
+                error=f"Owned work is not retried ({reason})",
+            )
+        )
+
+    def _retire_owned_leftovers(self, rid: str, request) -> bool:
+        """28: retire what only a retry would reuse; False when not proved.
+
+        The RAM boundary snapshot, the request's own caches and, strictly,
+        its SSD snapshots (cleanup_request(strict=True) raises on a writer
+        timeout, an unsafe path or a failed delete, where the default form
+        only logs). Idempotent. Callers guarantee no cache-store worker still
+        reads the snapshots: the request is out of self.requests, which a
+        finished request leaves only after its store drained.
+        """
+        failures = self.__dict__.setdefault("_owned_retirement_failures", set())
+        if rid in failures:
+            return False
+        self._boundary_cache_snapshots.pop(rid, None)
+        if request is not None:
+            request.prompt_cache = None
+            request._extracted_cache = None
+        store = self._boundary_snapshot_store
+        if store is not None:
+            try:
+                store.cleanup_request(rid, strict=True)
+            except Exception as error:
+                # Not proved retired: owned termination stays unresolved.
+                failures.add(rid)
+                logger.warning("Owned request %s snapshot cleanup failed: %s", rid, error)
+                return False
+        return True
+
+    def _end_owned_without_retry(self, request, reason: str) -> bool:
+        """28: end owned no-retry work at a retry site instead of retrying it.
+
+        Through the abort cleanup (no cache store), so every per-request
+        resource goes the way a live request's does: queues and prefill
+        state, uid maps and row registrations, paged blocks, boundary
+        snapshots, the prefill tracker and the request's own caches. The
+        error is published at the end of the step. Call it before the site
+        tears anything down. Every other request: False, and nothing changes.
+        """
+        if not self._owned_no_retry(request):
+            return False
+        rid = request.request_id
+        if self.requests.get(rid) is request:
+            try:
+                self._do_abort_request(rid, allow_cache_store=False)
+            except BaseException:
+                # Not proved retired: owned termination stays unresolved.
+                self.__dict__.setdefault("_owned_retirement_failures", set()).add(rid)
+                raise
+        self._queue_owned_no_retry_output(rid, reason)
+        return True
+
+    def _publish_owned_no_retry_outputs(self, output) -> None:
+        """End of step(): owned no-retry requests ended at a retry site this
+        step, or by an owned cleanup since the last one."""
+        if not self._owned_no_retry_outputs:
+            return
+        ended, self._owned_no_retry_outputs = self._owned_no_retry_outputs, []
+        for ended_output in ended:
+            output.outputs.append(ended_output)
+            output.finished_request_ids.add(ended_output.request_id)
+        output.has_work = True
+
+    @staticmethod
+    def _owned_waiting_fenced(request):
+        owned = getattr(request, "_prism_owned_admission", None)
+        if owned is None:
+            return False
+        if type(owned) is not OwnedAdmission or owned.request is not request:
+            return True
+        with owned._lock:
+            # 25b.4: only an unclassified or pristine-waiting handle is fenced;
+            # a requeued request whose running cleanup was refused progresses.
+            if owned._classified_state not in (None, "waiting"):
+                return False
+            # An unclassified handle whose request already started compute
+            # (then requeued) is not pristine; parking it would strand it.
+            if owned._classified_state is None and owned._started:
+                return False
+            return owned._cancelled or owned._cleanup_outcome in {
+                "failed", "unsupported", "capacity_refused", "consume_mismatch"
+            }
+
+    def _select_unfenced_waiting(self):
+        for _ in range(len(self.waiting)):
+            if not self._owned_waiting_fenced(self.waiting[0]):
+                return True
+            self.waiting.rotate(-1)
+        return False
+
+    def _owned_admission_complete(self, owned, request) -> bool:
+        future = owned.future
+        return (
+            owned.binding.scheduler is self and self._stream is owned.binding.stream
+            and getattr(request, "_prism_owned_admission", None) is owned
+            and future is not None and future is owned._submitted_future
+            and future.done() and not future.cancelled() and future.exception() is None
+            and owned._returned and owned._attempted
+        )
+
+    def _owned_running_refusal(self, owned, request, rid):
+        """Entangled or unsafe running states, refused before any mutation."""
+        with owned._lock:
+            text_only = owned._text_only
+        if not text_only or getattr(request, "rope_deltas", 0) != 0:
+            return "not_text_only"
+        if self._step_failed:
+            return "scheduler_dirty"
+        if rid in self._pending_abort_ids:
+            return "pending_abort"
+        if rid in self._prefill_eviction_awaiting:
+            return "eviction_pending"
+        model_refusal = self._owned_model_refusal()
+        if model_refusal is not None:
+            return model_refusal
+        if self._specprefill_active_request_id == rid:
+            return "specprefill"
+        if not self._owned_admission_complete(owned, request):
+            return "admission_incomplete"
+        return None
+
+    def _owned_model_refusal(self):
+        """Model-level entanglement owned work cannot stop safely; no request.
+
+        Shared by owned preparation (after the load) and owned cleanup, so
+        both refuse exactly the same models.
+        """
+        model = self.model
+        if _mtp_priming._eligible_host(model) is not None:
+            return "mtp_priming"
+        if _model_mtp_decode_enabled(model):
+            return "mtp_decode"
+        if _block_drafter_for(model) is not None:
+            return "block_drafter"
+        if getattr(self, "_vlm_mtp_drafter", None) is not None:
+            return "vlm_mtp"
+        if getattr(self, "_specprefill_draft_model", None) is not None:
+            return "specprefill"
+        return None
+
+    def _owned_running_state(self, request, rid):
+        """Exactly one supported running state, or None."""
+        uid = self.request_id_to_uid.get(rid)
+        in_waiting = any(r is request for r in self.waiting)
+        prefilling = sum(r is request for r in self.prefilling)
+        same_id_prefill = any(
+            r.request_id == rid and r is not request for r in self.prefilling
+        )
+        state = self._prefill_states.get(rid)
+        if (
+            request.status == RequestStatus.RUNNING
+            and self.running.get(rid) is request
+            and not in_waiting and prefilling == 0 and not same_id_prefill
+            and state is None
+            and isinstance(uid, int) and uid >= 0
+            and self.uid_to_request_id.get(uid) == rid
+            and getattr(request, "batch_uid", None) == uid
+            and sum(1 for value in self.request_id_to_uid.values() if value == uid) == 1
+            and self.batch_generator is not None
+            and set(self.batch_generator._find_uids([uid])) == {uid}
+        ):
+            return "decoding"
+        if (
+            request.status == RequestStatus.WAITING
+            and isinstance(state, _PrefillState) and state.request is request
+            and prefilling == 1 and not same_id_prefill and not in_waiting
+            and rid not in self.running and uid is None
+            and rid not in self.uid_to_request_id.values()
+        ):
+            return "chunked_prefill"
+        return None
+
+    def _cleanup_owned_request(self, owned):
+        """25b.4 single owned-cleanup entry, run as one executor job.
+
+        Classification precedes slot allocation; only supported states use a
+        proof slot. Refusals are recorded on the handle and leave the request
+        progressing normally. Nothing here certifies backend stop.
+        """
+        if type(owned) is not OwnedAdmission:
+            return None
+        request, rid = owned.request, owned.binding.request_id
+
+        def classify(state, outcome=None):
+            with owned._lock:
+                owned._classified_state = state
+                if outcome is not None:
+                    owned._cleanup_outcome = outcome
+
+        try:
+            owned.validate(owned.binding.core, rid)
+        except (ValueError, AttributeError):
+            owned._cleanup_outcome = "identity_or_admission_unavailable"
+            return None
+        if request is None or rid not in self.requests:
+            classify("absent", "absent")
+            return None
+        if self.requests.get(rid) is not request:
+            classify("identity_mismatch", "identity_or_admission_unavailable")
+            return None
+        if rid in self._inflight_store_futures or any(
+            entry[1] == rid for entry in self._pending_async_removes
+        ):
+            classify("finished_before_cleanup", "finished_before_cleanup")
+            return None
+        if any(r is request for r in self.waiting):
+            with owned._lock:
+                pristine = owned._waiting_pristine
+            if pristine:
+                classify("waiting")
+                return self._cleanup_owned_waiting(owned)
+            classify("non_pristine_waiting", "unsupported")
+            return None
+        try:
+            refusal = self._owned_running_refusal(owned, request, rid)
+            state = None if refusal is not None else self._owned_running_state(request, rid)
+        except Exception:
+            # Nothing was mutated; record it so the handle is never fenced.
+            classify("classification_failed", "failed")
+            return None
+        if refusal is not None:
+            classify(refusal, "unsupported")
+            return None
+        if state is None:
+            classify("unsupported_state", "unsupported")
+            return None
+        classify(state)
+        return self._cleanup_owned_running(owned, request, rid, state)
+
+    def _probe_owned_presence(self, owned):
+        """27.4a classification-only probe, run as one executor job.
+
+        The 25b.4 identity, presence and finished checks of
+        _cleanup_owned_request and nothing else: no slot, no mutation, and no
+        write to the handle's classification or cleanup fields.
+        """
+        if type(owned) is not OwnedAdmission:
+            return "unknown"
+        request, rid = owned.request, owned.binding.request_id
+        try:
+            owned.validate(owned.binding.core, rid)
+        except (ValueError, AttributeError):
+            return "unknown"
+        if rid in getattr(self, "_owned_retirement_failures", ()):
+            return "unknown"  # 28: gone from the queues, not proved retired
+        if request is None or rid not in self.requests:
+            # 28: owned no-retry work is absent only once nothing of it is
+            # left, whichever terminal path removed it from the scheduler.
+            if getattr(owned, "retry", True) is False and not self._retire_owned_leftovers(rid, request):
+                return "unknown"
+            return "absent"
+        if self.requests.get(rid) is not request:
+            return "unknown"
+        if rid in self._inflight_store_futures or any(
+            entry[1] == rid for entry in self._pending_async_removes
+        ):
+            return "finished_before_cleanup"
+        return "present"
+
+    def _cleanup_owned_running(self, owned, request, rid, state):
+        existing = self._owned_waiting_cleanup_proofs.get(rid)
+        if existing is not None:
+            if existing.handle is owned and existing.state == "cleaned":
+                return existing.fact
+            if existing.handle is not owned:
+                owned._cleanup_outcome = "stale_proof"
+            return None
+        if len(self._owned_waiting_cleanup_proofs) >= self._MAX_OWNED_WAITING_PROOFS:
+            owned._cleanup_outcome = "capacity_refused"
+            return None
+        proof = _WaitingCleanupProof(owned, request, owned.binding.generation_id)
+        self._owned_waiting_cleanup_proofs[rid] = proof
+        # Steps 1-3: checks and fallible work before any mutation.
+        try:
+            owned.validate(owned.binding.core, rid)
+            if time.monotonic() >= owned._stream_effective_deadline:
+                raise TimeoutError("owned_cleanup_expired")
+            if self._boundary_snapshot_store is not None:
+                self._boundary_snapshot_store.cleanup_request(rid, strict=True)
+            if self._stream is None:
+                raise RuntimeError("owned_cleanup_stream_unavailable")
+            mx.synchronize(self._stream)
+        except Exception:
+            proof.state = owned._cleanup_outcome = "failed"
+            return None
+        failures = []
+        drop_generator = False
+        # Step 4: first mutation. From here retirement always completes.
+        try:
+            if state == "decoding":
+                uid = self.request_id_to_uid[rid]
+                try:
+                    self._remove_uid_from_active_batch(uid)
+                except Exception:
+                    # remove() may have filtered part of the batch; the shared
+                    # generator is then in an unknown state for every row.
+                    drop_generator = True
+                    raise
+                if uid in self.batch_generator._find_uids([uid]):
+                    drop_generator = True
+                    failures.append("batch_row_still_present")
+            else:
+                prefill = self._prefill_states.pop(rid)
+                self.prefilling = deque(r for r in self.prefilling if r is not request)
+                prefill.cache = None
+        except Exception:
+            failures.append("first_mutation_failed")
+        # Step 5: block release, the ordinary-abort inverse for both states.
+        pcm = self.paged_cache_manager
+        try:
+            table = pcm.get_block_table(rid) if pcm is not None else None
+            if table is None:
+                table = getattr(request, "block_table", None)
+            if table and pcm is not None:
+                pcm.release_for_eviction(table.block_ids)
+        except Exception:
+            failures.append("block_release_failed")
+        try:
+            if self.block_aware_cache is not None:
+                self.block_aware_cache.clear_request_entry(rid)
+        except Exception:
+            failures.append("block_entry_clear_failed")
+        if pcm is not None:
+            with pcm._lock:
+                pcm.request_tables.pop(rid, None)
+        request.block_table = None
+
+        def guarded(name, action):
+            try:
+                action()
+            except Exception:
+                failures.append(name)
+
+        # Step 6: retirement.
+        if state == "decoding":
+            uid = self.request_id_to_uid.pop(rid, None)
+            if uid is not None:
+                if self.uid_to_request_id.get(uid) == rid:
+                    del self.uid_to_request_id[uid]
+                if hasattr(self.model, "unregister_rope_delta"):
+                    guarded("rope_delta", lambda: self.model.unregister_rope_delta(uid))
+                guarded("uid_row", lambda: _unregister_uid_row(self.model, uid))
+            self.running.pop(rid, None)
+        guarded("detokenizer", lambda: self._cleanup_detokenizer(rid))
+        guarded("output_parser", lambda: self._cleanup_output_parser_session(rid))
+        self._boundary_cache_snapshots.pop(rid, None)
+        guarded("prefill_tracker", lambda: get_prefill_tracker().remove(rid))
+        guarded("admission_bookkeeping", lambda: self._clear_request_admission_bookkeeping(rid))
+        request.set_finished(RequestStatus.FINISHED_ABORTED)
+        self.finished_req_ids.add(rid)
+        if self.requests.get(rid) is request:
+            del self.requests[rid]
+        request._extracted_cache = None
+        request.prompt_cache = None
+
+        def drop_shared_generator():
+            # Mirrors the _PrefillAbortedError recovery in step(): drop the
+            # generator and requeue the other running requests to re-prefill.
+            # Unlike that recovery, first forget their rows, as
+            # fail_all_requests does: a fresh generator may hand out the same
+            # uid numbers, and a stale map entry would let a later abort of a
+            # requeued request remove another request's row.
+            for other_rid in list(self.running):
+                other_uid = self.request_id_to_uid.pop(other_rid, None)
+                if other_uid is None:
+                    continue
+                if self.uid_to_request_id.get(other_uid) == other_rid:
+                    del self.uid_to_request_id[other_uid]
+                if hasattr(self.model, "unregister_rope_delta"):
+                    guarded("rope_delta", lambda u=other_uid: self.model.unregister_rope_delta(u))
+                guarded("uid_row", lambda u=other_uid: _unregister_uid_row(self.model, u))
+            self.batch_generator = None
+            self._current_sampler_params = None
+            self._boundary_cache_snapshots.clear()
+            if self._boundary_snapshot_store is not None:
+                # A failure here must not skip requeuing the other requests.
+                guarded("snapshot_cleanup_all", self._boundary_snapshot_store.cleanup_all)
+            self._boundary_snapshot_required = None
+            self._reschedule_running_requests()
+
+        if drop_generator:
+            guarded("generator_drop", drop_shared_generator)
+        guarded("deferred_metal_clear", self._schedule_deferred_metal_clear)
+        # Step 7.
+        if failures:
+            with owned._lock:
+                owned._cleanup_failures = tuple(failures)
+            proof.state = owned._cleanup_outcome = "failed"
+            return None
+        proof.fact = RunningCleaned(owned, request, proof.generation_id, rid, state)
+        proof.state = owned._cleanup_outcome = "cleaned"
+        return proof.fact
+
+    def _cleanup_owned_waiting(self, owned):
+        if type(owned) is not OwnedAdmission:
+            return None
+        request, rid = owned.request, owned.binding.request_id
+        try:
+            owned.validate(owned.binding.core, rid)
+            future = owned.future
+            if (
+                owned.binding.scheduler is not self or self._stream is not owned.binding.stream
+                or self.requests.get(rid) is not request
+                or getattr(request, "_prism_owned_admission", None) is not owned
+                or future is None or future is not owned._submitted_future
+                or not future.done() or future.cancelled() or future.exception() is not None
+                or not owned._returned or not owned._attempted
+            ):
+                owned._cleanup_outcome = "identity_or_admission_unavailable"
+                return None
+        except (ValueError, AttributeError):
+            owned._cleanup_outcome = "identity_or_admission_unavailable"
+            return None
+        existing = self._owned_waiting_cleanup_proofs.get(rid)
+        if existing is not None:
+            return existing.fact if existing.handle is owned and existing.state == "cleaned" else None
+        if len(self._owned_waiting_cleanup_proofs) >= self._MAX_OWNED_WAITING_PROOFS:
+            owned._cleanup_outcome = "capacity_refused"
+            return None
+        proof = _WaitingCleanupProof(owned, request, owned.binding.generation_id)
+        self._owned_waiting_cleanup_proofs[rid] = proof
+        try:
+            active_maps = [self.running, self._prefill_states, self.request_id_to_uid,
+                self._inflight_store_futures, self._boundary_cache_snapshots,
+                self._request_detokenizers, self._output_parser_sessions, self._prefix_cache_prepared]
+            unsupported = (
+                not owned._waiting_pristine or request.status != RequestStatus.WAITING
+                or sum(r is request for r in self.waiting) != 1
+                or any(r.request_id == rid and r is not request for r in self.waiting)
+                or any(r.request_id == rid for r in self.prefilling)
+                or any(rid in mapping for mapping in active_maps)
+                or rid in self.uid_to_request_id.values()
+                or any(entry[1] == rid for entry in self._pending_async_removes)
+                or rid in self._pending_abort_ids
+                or request.prefill_started_at is not None or request.generation_started_at is not None
+                or request.num_computed_tokens != 0 or request.cached_tokens != 0
+                or request.prefill_resumed_tokens != 0 or bool(request.output_token_ids)
+                or request.batch_uid is not None or request.prompt_cache is not None
+                or request.block_table is not None or getattr(request, "_extracted_cache", None) is not None
+                or bool(request.images) or bool(request.videos) or request.vlm_inputs_embeds is not None
+                or request.vlm_extra_kwargs is not None
+                or self._pending_prefill_eviction_request is not None
+                or (self.paged_cache_manager is not None and self.paged_cache_manager.get_block_table(rid) is not None)
+            )
+            if unsupported:
+                proof.state = owned._cleanup_outcome = "unsupported"
+                return None
+            owned.validate(owned.binding.core, rid)
+            if time.monotonic() >= owned._stream_effective_deadline:
+                raise TimeoutError("owned_cleanup_expired")
+            if self._boundary_snapshot_store is not None:
+                self._boundary_snapshot_store.cleanup_request(rid, strict=True)
+            owned.validate(owned.binding.core, rid)
+            if time.monotonic() >= owned._stream_effective_deadline:
+                raise TimeoutError("owned_cleanup_expired")
+            self._cache_freshness_waits.pop(rid, None)
+            self._throttle_notified_requests.discard(rid)
+            self._clear_memory_admission_blocker(rid)
+            self._clear_store_cache_admission_blocker(rid)
+            self.waiting.remove(request)
+            request.set_finished(RequestStatus.FINISHED_ABORTED)
+            self.finished_req_ids.add(rid)
+            if self.requests.get(rid) is not request:
+                raise ValueError("owned_cleanup_request_changed")
+            del self.requests[rid]
+            proof.fact = WaitingCleaned(owned, request, proof.generation_id, rid)
+            proof.state = owned._cleanup_outcome = "cleaned"
+            return proof.fact
+        except Exception:
+            proof.state = owned._cleanup_outcome = "failed"
+            return None
+
+    def _retain_consume_owned_waiting(self, owned, fact):
+        rid = owned.binding.request_id
+        proof = self._owned_waiting_cleanup_proofs.get(rid)
+        if proof is None or proof.handle is not owned or proof.state != "cleaned" or proof.fact is not fact:
+            if proof is not None:
+                proof.state = "failed"
+            owned._cleanup_outcome = "consume_mismatch"
+            return None
+        with owned._lock:
+            owned._cleanup_fact = fact
+            self._owned_waiting_cleanup_proofs.pop(rid)
+        return fact
+
     def _do_abort_request(
         self, request_id: str, *, allow_cache_store: bool = True
     ) -> bool:
@@ -11591,6 +12261,8 @@ class Scheduler:
         request = self.requests.get(request_id)
         if request is None:
             return False
+
+        self._invalidate_owned_waiting(request)
 
         # A finished request remains in self.requests while its async
         # store_cache worker owns boundary snapshots and cache buffers. Do not
@@ -11946,6 +12618,7 @@ class Scheduler:
         self.prefilling.clear()
         self._prefill_states.clear()
         for request in list(self.waiting):
+            self._invalidate_owned_waiting(request)
             failed_ids.append(request.request_id)
             req = self.requests.pop(request.request_id, None)
             self._clear_request_admission_bookkeeping(request.request_id)
@@ -12030,6 +12703,8 @@ class Scheduler:
         # failed requests, so the dashboard and the macOS app keep showing
         # them as "generating" until the next successful step (#2126).
         self._publish_admin_snapshot()
+        self._prefill_eviction_awaiting.clear()
+        self._step_failed = False
         return failed_ids
 
     def get_num_waiting(self) -> int:
@@ -12529,6 +13204,8 @@ class Scheduler:
             self.waiting
             and self._num_admitted_requests() < self._effective_max_num_seqs()
         ):
+            if not self._select_unfenced_waiting():
+                break
             # Admission pause: set by ProcessMemoryEnforcer when phys
             # crosses soft_threshold. New prefills wait; in-flight requests
             # continue. First request always passes (no admitted work yet)
@@ -12636,6 +13313,7 @@ class Scheduler:
                 break
 
             request = self.waiting.popleft()
+            self._invalidate_owned_waiting(request)
             self._cache_freshness_waits.pop(request.request_id, None)
             self._clear_memory_admission_blocker(request.request_id)
             self._clear_store_cache_admission_blocker(request.request_id)
@@ -12658,7 +13336,9 @@ class Scheduler:
             # gpu,0 busy — the #2330 twin-prefill hang. Same class as the
             # #2183/#2197 chunk-view and #2235 batch-KV-mutation fixes.
             with mx.stream(self._stream):
-                self._prepare_prefix_cache_for_request(request)
+                if self._prepare_prefix_cache_for_request(request) is self._OWNED_PREFIX_FENCED:
+                    self.waiting.appendleft(request)
+                    continue
 
             # Determine tokens to process and cache to use
             # Note: Don't use `remaining_tokens or prompt_token_ids` because empty list
@@ -12799,6 +13479,8 @@ class Scheduler:
             try:
                 preflight_rejection = self._preflight_memory_check(request)
             except _PrefillEvictionNeeded as e:
+                if self._end_owned_without_retry(request, "prefill_eviction"):
+                    continue  # 28: never paused for an eviction
                 self._pause_for_prefill_eviction(request, e.request)
                 break
             if preflight_rejection is not None:
@@ -12818,6 +13500,10 @@ class Scheduler:
                     )
                 )
                 continue
+
+            # Every path below starts compute for this request, requeues it
+            # after starting, or removes it.
+            self._mark_owned_started(request)
 
             # SpecPrefill: replace tokens with selected subset and pre-fill
             # cache via sparse_prefill before inserting into BatchGenerator.
@@ -13075,6 +13761,9 @@ class Scheduler:
                         # throttle instead of recomputing the whole prompt
                         # cold (#2180). Mirrors the in-flight pause in
                         # _advance_chunked_prefills, which also keeps state.
+                        if self._end_owned_without_retry(request, "prefill_eviction"):
+                            Scheduler._clear_cache(self)
+                            continue  # 28: never paused for an eviction
                         self._pause_for_prefill_eviction(request, e.request)
                         break
                     except PrefillMemoryExceededError as e:
@@ -13157,6 +13846,12 @@ class Scheduler:
                     self.uid_to_request_id.pop(temp_uid, None)
                     self.request_id_to_uid.pop(request.request_id, None)
                     get_prefill_tracker().remove(request.request_id)
+                    # 28: never paused. The abort cleanup also drops the partial
+                    # cache _do_external_prefill kept on the request for a resume,
+                    # and any boundary snapshot an earlier chunk captured.
+                    if self._end_owned_without_retry(request, "prefill_eviction"):
+                        Scheduler._clear_cache(self)
+                        continue
                     self._pause_for_prefill_eviction(request, e.request)
                     break
                 except PrefillMemoryExceededError as e:
@@ -14449,12 +15144,22 @@ class Scheduler:
         else:
             candidates = list(self.running.items())
         for request_id, request in candidates:
+            # 28: outside a cache reset the request's state is intact, so owned
+            # no-retry work is ended through the abort cleanup. A reset already
+            # cleared every uid map and the cache, so there it takes the
+            # failure branch below, as a request out of retries does.
+            if not is_corruption and self._end_owned_without_retry(request, "reschedule"):
+                continue
+            owned_end = is_corruption and self._owned_no_retry(request)
             if is_corruption:
                 request.cache_corruption_retries += 1
-                if request.cache_corruption_retries > max_corruption_retries:
+                if owned_end or request.cache_corruption_retries > max_corruption_retries:
                     failed_ids.append(request_id)
                     self.running.pop(request_id, None)
                     self._drop_from_prefill_queues(request_id)
+                    if owned_end:
+                        self._release_paged_cache_for_request(request_id)
+                        self._drop_boundary_snapshots_for_request(request_id)
                     # Clean up from requests dict (prevent memory leak)
                     req = self.requests.pop(request_id, None)
                     self._clear_request_admission_bookkeeping(request_id)
@@ -14528,8 +15233,12 @@ class Scheduler:
             if self._boundary_snapshot_store is not None:
                 self._boundary_snapshot_store.cleanup_request(request_id)
             get_prefill_tracker().remove(request_id)
-            if request.generation_overflow_retries > max_generation_overflow_retries:
-                failed_ids.append(request_id)
+            # 28: owned no-retry work fails here instead of retrying serially.
+            owned_end = self._owned_no_retry(request)
+            if owned_end or request.generation_overflow_retries > max_generation_overflow_retries:
+                failed_ids.append(request_id)  # the caller publishes these
+                if owned_end:
+                    self._release_paged_cache_for_request(request_id)
                 req = self.requests.pop(request_id, None)
                 self._clear_request_admission_bookkeeping(request_id)
                 if req is not None:
@@ -14576,6 +15285,12 @@ class Scheduler:
         Only memory-limit failures are retried; any other RuntimeError fails
         immediately so genuine model errors don't loop.
         """
+        if Scheduler._owned_no_retry(request):
+            # 28: owned no-retry work fails here. The catch sites released its
+            # blocks and the request; release what only a retry would have
+            # reused too: boundary snapshots and the request's own caches.
+            self._retire_owned_leftovers(request.request_id, request)
+            return False
         if memory_pressure is None:
             memory_pressure = "Memory limit exceeded" in str(error)
         if not memory_pressure:
@@ -14738,6 +15453,8 @@ class Scheduler:
                 # An emergency abort ends these requests anyway.
                 if self._pending_abort_ids:
                     break
+                if self._owned_no_retry(request):
+                    continue  # 28: ended below, never resumed
                 state = self._prefill_states.get(request.request_id)
                 live_tokens = (
                     _cache_base_sizes(state.cache)
@@ -14757,17 +15474,23 @@ class Scheduler:
                     )
         for request in live:
             row = rows.get(request.request_id)
-            if row is not None:
+            if row is not None and not self._owned_no_retry(request):
                 self._save_requeue_row_state(request, *row)
 
         self.batch_generator = None
         self._current_sampler_params = None
         self.prefilling = deque()
+        # 28: owned no-retry work is ended through the abort cleanup instead of
+        # being detached and requeued; the rest as before.
+        requeued = []
         for request in live:
+            if self._end_owned_without_retry(request, "memory_requeue"):
+                continue
             self._detach_for_memory_requeue(request)
-        for request in reversed(live):
+            requeued.append(request)
+        for request in reversed(requeued):
             self.waiting.appendleft(request)
-        self._memory_requeue_ids.update(r.request_id for r in live)
+        self._memory_requeue_ids.update(r.request_id for r in requeued)
         Scheduler._clear_cache(self)
         logger.warning(
             "Memory pressure: requeued %d request(s) in %.1fs; tokens kept in the "
@@ -14960,6 +15683,32 @@ class Scheduler:
         )
 
     def step(self) -> SchedulerOutput:
+        """One scheduling step; marks the scheduler dirty if an exception escapes."""
+        try:
+            return self._step_unguarded()
+        except BaseException:
+            self._step_failed = True
+            raise
+
+    def _publish_prefill_eviction(self, output) -> None:
+        """Hand a paused prefill's eviction request to the engine loop.
+
+        The id stays in ``_prefill_eviction_awaiting`` until the loop calls
+        ``prefill_eviction_finished``; owned cleanup refuses meanwhile.
+        """
+        if self._pending_prefill_eviction_request is not None:
+            output.prefill_eviction_request = self._pending_prefill_eviction_request
+            self._prefill_eviction_awaiting.add(
+                self._pending_prefill_eviction_request.request_id
+            )
+            self._pending_prefill_eviction_request = None
+            output.has_work = True
+
+    def prefill_eviction_finished(self, request_id: str) -> None:
+        """Event loop: the eviction callback for this request has returned."""
+        self._prefill_eviction_awaiting.discard(request_id)
+
+    def _step_unguarded(self) -> SchedulerOutput:
         """
         Execute one scheduling step with automatic error recovery.
 
@@ -15045,10 +15794,7 @@ class Scheduler:
             if rejected:
                 output.outputs.extend(rejected)
                 output.has_work = True
-            if self._pending_prefill_eviction_request is not None:
-                output.prefill_eviction_request = self._pending_prefill_eviction_request
-                self._pending_prefill_eviction_request = None
-                output.has_work = True
+            self._publish_prefill_eviction(output)
 
             # Run generation step if we have running requests.
             # Use next_generated() which returns only GenerationBatch.Response
@@ -15256,6 +16002,8 @@ class Scheduler:
 
         self._publish_admin_snapshot()
 
+        self._publish_owned_no_retry_outputs(output)
+
         return output
 
     def _publish_admin_snapshot(self) -> None:
@@ -15351,6 +16099,8 @@ class Scheduler:
         for request_id in list(self.requests.keys()):
             self._do_abort_request(request_id, allow_cache_store=False)
 
+        for request in self.waiting:
+            self._invalidate_owned_waiting(request)
         self.waiting.clear()
         self.prefilling.clear()
         self._prefill_states.clear()

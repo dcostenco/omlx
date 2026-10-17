@@ -303,6 +303,8 @@ class ServerState:
     ms_downloader: Optional[object] = None  # MSDownloader
     process_memory_enforcer: Optional[object] = None  # ProcessMemoryEnforcer
     responses_store: ResponseStore = field(default_factory=ResponseStore)
+    prism_control_store: Optional[object] = None  # ControlStore; no engine authority
+    prism_control_coordinator: Optional[object] = None  # ControlCoordinator; owns executions
     oq_manager: Optional[object] = None  # OQManager
     hf_uploader: Optional[object] = None  # HFUploader
     # False while the startup pinned-model preload is still running.
@@ -321,6 +323,32 @@ _server_state: ServerState = ServerState()
 def get_server_state() -> ServerState:
     """Get the global server state."""
     return _server_state
+
+
+CONTROL_SETTINGS_SECTIONS = (
+    "server", "memory", "cache", "scheduler", "sampling", "idle_timeout"
+)
+
+
+def get_control_settings_snapshot(model_id: str) -> dict:
+    """Cold configuration identity only; never acquire or start an engine."""
+    pool = _server_state.engine_pool
+    settings = _server_state.global_settings
+    if pool is None or settings is None:
+        raise HTTPException(status_code=503, detail="Control settings unavailable")
+    if pool.get_entry(model_id) is None:
+        raise HTTPException(status_code=404, detail="Control model unknown")
+    per_model = get_model_settings_for_request(model_id)
+    if per_model is None:
+        raise HTTPException(status_code=503, detail="Control settings unavailable")
+    return {
+        "snapshot_version": 1,
+        "model_settings": per_model.to_dict(),
+        "sampling_defaults": asdict(_server_state.sampling),
+        "global_settings": {
+            name: asdict(getattr(settings, name)) for name in CONTROL_SETTINGS_SECTIONS
+        },
+    }
 
 
 def get_engine_pool() -> EnginePool:
@@ -699,6 +727,11 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Drain owned control executions first, while every engine is still up.
+    # The drain never cancels; anything unfinished stays claimed (fail closed).
+    if _server_state.prism_control_coordinator is not None:
+        await _server_state.prism_control_coordinator.drain()
+
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
     if bonjour_task is not None:
         bonjour_task.cancel()
@@ -752,6 +785,22 @@ app = FastAPI(
     description="LLM inference, optimized for your Mac",
     version=__version__,
     lifespan=lifespan,
+)
+
+# Control status uses strict key verification even when inference auth is bypassed.
+from .api.prism_control_routes import (
+    configure_control_coordinator,
+    configure_control_store,
+    create_control_router,
+)
+from .owned_preparation import make_admission_stage, owned_request_refusal
+from .admin.auth import verify_any_api_key
+from .utils.network import is_loopback_bind
+
+app.include_router(
+    create_control_router(
+        get_server_state, verify_any_api_key, is_loopback_bind, get_control_settings_snapshot
+    )
 )
 
 # Include MCP routes
@@ -2397,6 +2446,27 @@ def init_server(
     # Initialize model settings manager
     base_path = (
         Path(global_settings.base_path) if global_settings else Path.home() / ".omlx"
+    )
+    configure_control_store(_server_state, base_path, is_loopback_bind)
+    configure_control_coordinator(
+        _server_state,
+        get_control_settings_snapshot,
+        # 27.5: owned admission, streaming and termination. MCP exposure is
+        # off for owned work; the oQ manager is read at each call, since it
+        # is created after this.
+        make_admission_stage(
+            lambda: _server_state.engine_pool,
+            lambda engine, request, model_id: _prepare_responses_chat(
+                engine, request, model_id, mcp_manager=None
+            ),
+            lambda request: owned_request_refusal(
+                request,
+                quantizing=bool(
+                    _server_state.oq_manager
+                    and _server_state.oq_manager.is_quantizing
+                ),
+            ),
+        ),
     )
     _server_state.settings_manager = ModelSettingsManager(base_path)
 
@@ -8076,6 +8146,314 @@ def _store_response_state(
     _server_state.responses_store.put(public_response["id"], record)
 
 
+@dataclass
+class _ResponsesChat:
+    """The locals create_response reads after its preparation block."""
+
+    messages: object
+    chat_kwargs: object
+    current_input_messages: object
+    namespace_aliases: object
+    response_format: object
+    response_format_warning: object
+    native_response_format: object
+    native_reasoning: object
+    tools_for_template: object
+    temperature: object
+    top_p: object
+
+
+async def _prepare_responses_chat(engine, request, resolved_model, *, mcp_manager):
+    """create_response's preparation block, shared with owned admission.
+
+    Moved verbatim; the only change is that the MCP manager is a parameter.
+    create_response passes the server's; owned admission passes None, so
+    owned work gets the ordinary prompt and sampling with MCP exposure off.
+    """
+    # Images in function_call_output lists survive only for engines that
+    # can extract them; text engines get a placeholder instead so base64
+    # payloads never reach the prompt (#2989).
+    preserve_tool_images = _engine_accepts_images(engine)
+
+    current_input_messages = convert_responses_input_to_messages(
+        request.input,
+        consolidate_system_messages=False,
+        preserve_images=preserve_tool_images,
+    )
+
+    # Build previous context from previous_response_id
+    previous_messages = None
+    if request.previous_response_id:
+        previous_messages = _resolve_previous_response_messages(
+            request.previous_response_id
+        )
+
+    # Convert Responses API input → internal messages
+    messages = convert_responses_input_to_messages(
+        request.input,
+        request.instructions,
+        previous_messages,
+        consolidate_system_messages=False,
+        preserve_images=preserve_tool_images,
+    )
+
+    # Convert tools: flat → nested. namespace_aliases maps each expanded
+    # namespace member's wire name back for the return path.
+    namespace_aliases: dict = {}
+    openai_tools = convert_responses_tools(request.tools, namespace_aliases)
+    apply_namespace_tool_aliases(messages, namespace_aliases)
+    if (
+        getattr(engine, "is_diffusion_model", False)
+        and not getattr(engine, "supports_tool_calling", False)
+        and openai_tools
+    ):
+        raise InvalidRequestError(
+            "Tool calling is not supported for this diffusion model "
+            "(no tool parser matched its chat template).",
+            field="tools",
+        )
+
+    # Get per-model settings
+    reasoning_parser = None
+    ms = get_model_settings_for_request(request.model)
+    if ms:
+        reasoning_parser = ms.reasoning_parser
+    merged_ct_kwargs = merge_chat_template_request_kwargs(
+        ms,
+        merge_reasoning_effort_chat_template_kwargs(
+            request.chat_template_kwargs,
+            (
+                request.reasoning.get("effort")
+                if isinstance(request.reasoning, dict)
+                else None
+            ),
+        ),
+    )
+
+    # Auto-set enable_thinking when a positive thinking budget is active.
+    # Set it before grammar compilation, which reads the thinking state.
+    thinking_budget = _resolve_thinking_budget(request, request.model)
+    if (
+        thinking_budget is not None
+        and thinking_budget > 0
+        and "enable_thinking" not in merged_ct_kwargs
+    ):
+        merged_ct_kwargs["enable_thinking"] = True
+
+    _entry = get_engine_pool().get_entry(resolved_model)
+
+    # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
+    # are NOT called here because convert_responses_input_to_messages() already
+    # returns plain dicts in {"role": str, "content": str} format.
+    # Those extract functions expect Pydantic Message objects from OpenAI/Anthropic requests.
+
+    # Handle text.format (structured output)
+    response_format = None
+    compiled_grammar = None
+    response_format_warning = None
+    native_response_format = None
+    if request.text and request.text.format:
+        fmt = request.text.format
+        if fmt.type == "json_object":
+            response_format = {"type": "json_object"}
+        elif fmt.type == "json_schema":
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": fmt.name or "response",
+                    "schema": fmt.schema_ or {},
+                    "strict": fmt.strict or False,
+                },
+            }
+        if response_format:
+            from .api.openai_models import ResponseFormat
+
+            _reject_diffusion_structured_outputs(
+                engine,
+                response_format=response_format,
+            )
+            native_response_format = _native_response_format(
+                engine, response_format
+            )
+            if native_response_format is None:
+                await engine.start()
+                rf = ResponseFormat(**response_format)
+                compiled_grammar = _compile_grammar_for_request(
+                    engine,
+                    response_format=rf,
+                    chat_template_kwargs=merged_ct_kwargs or None,
+                    reasoning_parser=reasoning_parser,
+                )
+            if native_response_format is None and compiled_grammar is None:
+                # Non-strict formats still degrade to prompt injection, so
+                # surface it to the caller with the same Warning response
+                # header /v1/chat/completions uses; the log line alone only
+                # ever reaches the operator (#1241).
+                response_format_warning = _response_format_warning_header(rf)
+                json_instruction = build_json_system_prompt(rf)
+                if json_instruction:
+                    messages = _inject_json_instruction(messages, json_instruction)
+        else:
+            compiled_grammar = None
+
+    # Merge MCP tools, matching create_chat_completion's tools_disabled
+    # semantics: tool_choice="none" suppresses tool exposure to the chat
+    # template, and the MCP merge itself must run even when the client
+    # sent no tools of its own, since MCP servers can offer tools the
+    # client never listed.
+    tools_disabled = request.tool_choice == "none" or (
+        getattr(engine, "is_diffusion_model", False)
+        and not getattr(engine, "supports_tool_calling", False)
+    )
+    effective_tools = None if tools_disabled else openai_tools
+    if (
+        mcp_manager
+        and not tools_disabled
+        and mcp_tools_exposed()
+    ):
+        effective_tools = mcp_manager.get_merged_tools(openai_tools)
+
+    # Convert tools for chat template
+    tools_for_template = (
+        convert_tools_for_template(effective_tools) if effective_tools else None
+    )
+    # Resolve template defaults before preparing the prompt for reuse.
+    native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+    if (
+        native_reasoning
+        and merged_ct_kwargs.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged_ct_kwargs
+    ):
+        merged_ct_kwargs["preserve_thinking"] = True
+
+    # Gemma 4 drops required params that lack descriptions — enrich them
+    if tools_for_template and "gemma" in (resolved_model or "").lower():
+        tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
+    await _ensure_tokenizer_for_system_probe(engine, messages)
+    messages = prepare_system_messages_for_template(
+        messages,
+        engine.tokenizer,
+        tools=tools_for_template,
+        chat_template_kwargs=merged_ct_kwargs or None,
+        is_partial=False,
+        unsupported_mid_system_policy=_unsupported_mid_system_policy(),
+    )
+
+    # Validate context window
+    try:
+        num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+            engine,
+            messages,
+            tools_for_template,
+            chat_template_kwargs=merged_ct_kwargs or None,
+        )
+    except Exception as e:
+        err_name = type(e).__name__.lower()
+        err_msg = str(e).lower()
+        if (
+            "template" in err_name
+            or "template" in err_msg
+            or isinstance(e, (AssertionError, ValueError))
+        ):
+            raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
+        raise
+    validate_context_window(num_prompt_tokens, request.model)
+
+    # Build sampling kwargs
+    (
+        temperature,
+        top_p,
+        top_k,
+        repetition_penalty,
+        min_p,
+        presence_penalty,
+        frequency_penalty,
+        max_tokens,
+        xtc_probability,
+        xtc_threshold,
+    ) = get_sampling_params(
+        request.temperature,
+        request.top_p,
+        request.model,
+        req_top_k=getattr(request, "top_k", None),
+        req_repetition_penalty=getattr(request, "repetition_penalty", None),
+        req_max_tokens=request.max_output_tokens,
+    )
+    chat_kwargs = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+        "repetition_penalty": repetition_penalty,
+        "presence_penalty": presence_penalty,
+        "frequency_penalty": frequency_penalty,
+        "xtc_probability": xtc_probability,
+        "xtc_threshold": xtc_threshold,
+    }
+
+    # Widen the repetition-penalty look-back window when the client
+    # asks for it (mlx-lm default window is 20 tokens).
+    repetition_context_size = getattr(
+        request, "repetition_context_size", None
+    )
+    if repetition_context_size is not None:
+        chat_kwargs["repetition_context_size"] = repetition_context_size
+
+    # Add seed for reproducible generation (best-effort)
+    if request.seed is not None:
+        chat_kwargs["seed"] = request.seed
+
+    # Add thinking budget if applicable
+    if thinking_budget is not None:
+        chat_kwargs["thinking_budget"] = thinking_budget
+
+    if prepared_prompt is not None:
+        chat_kwargs["_prepared_prompt"] = prepared_prompt
+
+    # Add compiled grammar for logit-level structured output.
+    if compiled_grammar is not None:
+        chat_kwargs["compiled_grammar"] = compiled_grammar
+        if reasoning_parser and "thinking_budget" not in chat_kwargs:
+            default_budget = min(max_tokens // 2, 4096)
+            chat_kwargs["thinking_budget"] = default_budget
+            logger.debug(
+                "Auto-set thinking_budget=%d for grammar-constrained request",
+                default_budget,
+            )
+
+    if tools_for_template:
+        chat_kwargs["tools"] = tools_for_template
+    if merged_ct_kwargs:
+        chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
+    chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
+        ms,
+        native_reasoning=uses_native_reasoning_content(
+            resolved_model,
+            config_model_type=getattr(_entry, "config_model_type", None),
+            engine_model_type=getattr(engine, "model_type", None),
+            preserve_thinking_default=getattr(
+                _entry, "preserve_thinking_default", None
+            ),
+        ),
+        chat_template_kwargs=merged_ct_kwargs,
+    )
+    return _ResponsesChat(
+        messages=messages,
+        chat_kwargs=chat_kwargs,
+        current_input_messages=current_input_messages,
+        namespace_aliases=namespace_aliases,
+        response_format=response_format,
+        response_format_warning=response_format_warning,
+        native_response_format=native_response_format,
+        native_reasoning=native_reasoning,
+        tools_for_template=tools_for_template,
+        temperature=temperature,
+        top_p=top_p,
+    )
+
+
 @app.post("/v1/responses")
 async def create_response(
     request: ResponsesRequest,
@@ -8102,275 +8480,20 @@ async def create_response(
 
         resolved_model = _serving_model_id(lease, request.model)
 
-        # Images in function_call_output lists survive only for engines that
-        # can extract them; text engines get a placeholder instead so base64
-        # payloads never reach the prompt (#2989).
-        preserve_tool_images = _engine_accepts_images(engine)
-
-        current_input_messages = convert_responses_input_to_messages(
-            request.input,
-            consolidate_system_messages=False,
-            preserve_images=preserve_tool_images,
+        prepared_chat = await _prepare_responses_chat(
+            engine, request, resolved_model, mcp_manager=_server_state.mcp_manager
         )
-
-        # Build previous context from previous_response_id
-        previous_messages = None
-        if request.previous_response_id:
-            previous_messages = _resolve_previous_response_messages(
-                request.previous_response_id
-            )
-
-        # Convert Responses API input → internal messages
-        messages = convert_responses_input_to_messages(
-            request.input,
-            request.instructions,
-            previous_messages,
-            consolidate_system_messages=False,
-            preserve_images=preserve_tool_images,
-        )
-
-        # Convert tools: flat → nested. namespace_aliases maps each expanded
-        # namespace member's wire name back for the return path.
-        namespace_aliases: dict = {}
-        openai_tools = convert_responses_tools(request.tools, namespace_aliases)
-        apply_namespace_tool_aliases(messages, namespace_aliases)
-        if (
-            getattr(engine, "is_diffusion_model", False)
-            and not getattr(engine, "supports_tool_calling", False)
-            and openai_tools
-        ):
-            raise InvalidRequestError(
-                "Tool calling is not supported for this diffusion model "
-                "(no tool parser matched its chat template).",
-                field="tools",
-            )
-
-        # Get per-model settings
-        reasoning_parser = None
-        ms = get_model_settings_for_request(request.model)
-        if ms:
-            reasoning_parser = ms.reasoning_parser
-        merged_ct_kwargs = merge_chat_template_request_kwargs(
-            ms,
-            merge_reasoning_effort_chat_template_kwargs(
-                request.chat_template_kwargs,
-                (
-                    request.reasoning.get("effort")
-                    if isinstance(request.reasoning, dict)
-                    else None
-                ),
-            ),
-        )
-
-        # Auto-set enable_thinking when a positive thinking budget is active.
-        # Set it before grammar compilation, which reads the thinking state.
-        thinking_budget = _resolve_thinking_budget(request, request.model)
-        if (
-            thinking_budget is not None
-            and thinking_budget > 0
-            and "enable_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["enable_thinking"] = True
-
-        _entry = get_engine_pool().get_entry(resolved_model)
-
-        # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
-        # are NOT called here because convert_responses_input_to_messages() already
-        # returns plain dicts in {"role": str, "content": str} format.
-        # Those extract functions expect Pydantic Message objects from OpenAI/Anthropic requests.
-
-        # Handle text.format (structured output)
-        response_format = None
-        compiled_grammar = None
-        response_format_warning = None
-        native_response_format = None
-        if request.text and request.text.format:
-            fmt = request.text.format
-            if fmt.type == "json_object":
-                response_format = {"type": "json_object"}
-            elif fmt.type == "json_schema":
-                response_format = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": fmt.name or "response",
-                        "schema": fmt.schema_ or {},
-                        "strict": fmt.strict or False,
-                    },
-                }
-            if response_format:
-                from .api.openai_models import ResponseFormat
-
-                _reject_diffusion_structured_outputs(
-                    engine,
-                    response_format=response_format,
-                )
-                native_response_format = _native_response_format(
-                    engine, response_format
-                )
-                if native_response_format is None:
-                    await engine.start()
-                    rf = ResponseFormat(**response_format)
-                    compiled_grammar = _compile_grammar_for_request(
-                        engine,
-                        response_format=rf,
-                        chat_template_kwargs=merged_ct_kwargs or None,
-                        reasoning_parser=reasoning_parser,
-                    )
-                if native_response_format is None and compiled_grammar is None:
-                    # Non-strict formats still degrade to prompt injection, so
-                    # surface it to the caller with the same Warning response
-                    # header /v1/chat/completions uses; the log line alone only
-                    # ever reaches the operator (#1241).
-                    response_format_warning = _response_format_warning_header(rf)
-                    json_instruction = build_json_system_prompt(rf)
-                    if json_instruction:
-                        messages = _inject_json_instruction(messages, json_instruction)
-            else:
-                compiled_grammar = None
-
-        # Merge MCP tools, matching create_chat_completion's tools_disabled
-        # semantics: tool_choice="none" suppresses tool exposure to the chat
-        # template, and the MCP merge itself must run even when the client
-        # sent no tools of its own, since MCP servers can offer tools the
-        # client never listed.
-        tools_disabled = request.tool_choice == "none" or (
-            getattr(engine, "is_diffusion_model", False)
-            and not getattr(engine, "supports_tool_calling", False)
-        )
-        effective_tools = None if tools_disabled else openai_tools
-        if (
-            _server_state.mcp_manager
-            and not tools_disabled
-            and mcp_tools_exposed()
-        ):
-            effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
-
-        # Convert tools for chat template
-        tools_for_template = (
-            convert_tools_for_template(effective_tools) if effective_tools else None
-        )
-        # Resolve template defaults before preparing the prompt for reuse.
-        native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
-        if (
-            native_reasoning
-            and merged_ct_kwargs.get("enable_thinking") is not False
-            and "preserve_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["preserve_thinking"] = True
-
-        # Gemma 4 drops required params that lack descriptions — enrich them
-        if tools_for_template and "gemma" in (resolved_model or "").lower():
-            tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
-        await _ensure_tokenizer_for_system_probe(engine, messages)
-        messages = prepare_system_messages_for_template(
-            messages,
-            engine.tokenizer,
-            tools=tools_for_template,
-            chat_template_kwargs=merged_ct_kwargs or None,
-            is_partial=False,
-            unsupported_mid_system_policy=_unsupported_mid_system_policy(),
-        )
-
-        # Validate context window
-        try:
-            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
-                engine,
-                messages,
-                tools_for_template,
-                chat_template_kwargs=merged_ct_kwargs or None,
-            )
-        except Exception as e:
-            err_name = type(e).__name__.lower()
-            err_msg = str(e).lower()
-            if (
-                "template" in err_name
-                or "template" in err_msg
-                or isinstance(e, (AssertionError, ValueError))
-            ):
-                raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
-            raise
-        validate_context_window(num_prompt_tokens, request.model)
-
-        # Build sampling kwargs
-        (
-            temperature,
-            top_p,
-            top_k,
-            repetition_penalty,
-            min_p,
-            presence_penalty,
-            frequency_penalty,
-            max_tokens,
-            xtc_probability,
-            xtc_threshold,
-        ) = get_sampling_params(
-            request.temperature,
-            request.top_p,
-            request.model,
-            req_top_k=getattr(request, "top_k", None),
-            req_repetition_penalty=getattr(request, "repetition_penalty", None),
-            req_max_tokens=request.max_output_tokens,
-        )
-        chat_kwargs = {
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "min_p": min_p,
-            "repetition_penalty": repetition_penalty,
-            "presence_penalty": presence_penalty,
-            "frequency_penalty": frequency_penalty,
-            "xtc_probability": xtc_probability,
-            "xtc_threshold": xtc_threshold,
-        }
-
-        # Widen the repetition-penalty look-back window when the client
-        # asks for it (mlx-lm default window is 20 tokens).
-        repetition_context_size = getattr(
-            request, "repetition_context_size", None
-        )
-        if repetition_context_size is not None:
-            chat_kwargs["repetition_context_size"] = repetition_context_size
-
-        # Add seed for reproducible generation (best-effort)
-        if request.seed is not None:
-            chat_kwargs["seed"] = request.seed
-
-        # Add thinking budget if applicable
-        if thinking_budget is not None:
-            chat_kwargs["thinking_budget"] = thinking_budget
-
-        if prepared_prompt is not None:
-            chat_kwargs["_prepared_prompt"] = prepared_prompt
-
-        # Add compiled grammar for logit-level structured output.
-        if compiled_grammar is not None:
-            chat_kwargs["compiled_grammar"] = compiled_grammar
-            if reasoning_parser and "thinking_budget" not in chat_kwargs:
-                default_budget = min(max_tokens // 2, 4096)
-                chat_kwargs["thinking_budget"] = default_budget
-                logger.debug(
-                    "Auto-set thinking_budget=%d for grammar-constrained request",
-                    default_budget,
-                )
-
-        if tools_for_template:
-            chat_kwargs["tools"] = tools_for_template
-        if merged_ct_kwargs:
-            chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
-
-        chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
-            ms,
-            native_reasoning=uses_native_reasoning_content(
-                resolved_model,
-                config_model_type=getattr(_entry, "config_model_type", None),
-                engine_model_type=getattr(engine, "model_type", None),
-                preserve_thinking_default=getattr(
-                    _entry, "preserve_thinking_default", None
-                ),
-            ),
-            chat_template_kwargs=merged_ct_kwargs,
-        )
+        messages = prepared_chat.messages
+        chat_kwargs = prepared_chat.chat_kwargs
+        current_input_messages = prepared_chat.current_input_messages
+        namespace_aliases = prepared_chat.namespace_aliases
+        response_format = prepared_chat.response_format
+        response_format_warning = prepared_chat.response_format_warning
+        native_response_format = prepared_chat.native_response_format
+        native_reasoning = prepared_chat.native_reasoning
+        tools_for_template = prepared_chat.tools_for_template
+        temperature = prepared_chat.temperature
+        top_p = prepared_chat.top_p
 
         # Pre-flight prefill memory guard — must precede any StreamingResponse
         # return so PrefillMemoryExceededError can be mapped to HTTP 400.

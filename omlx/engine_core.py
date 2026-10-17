@@ -44,6 +44,7 @@ from .exceptions import (
 )
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
+from .owned_admission import OwnedAdmission, RunningCleaned, StreamSynchronized, WaitingCleaned
 from .request import Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig, _sync_and_clear_cache
 from .utils.fatal import (
@@ -330,6 +331,8 @@ class EngineCore:
         self.tokenizer = tokenizer
         self.config = config or EngineConfig()
         self._engine_id = engine_id or str(uuid.uuid4())
+        # Control proofs need an instance nonce even when a caller reuses a label.
+        self._prism_control_generation_id = str(uuid.uuid4())
         self._owns_model = False
         self._closed = False
         self._close_lock = threading.Lock()
@@ -577,7 +580,13 @@ class EngineCore:
                                 "Running prefill LRU eviction for request %s",
                                 eviction_request.request_id,
                             )
-                            evicted = await callback(eviction_request)
+                            try:
+                                evicted = await callback(eviction_request)
+                            finally:
+                                # Owned cleanup refuses while this is pending.
+                                self.scheduler.prefill_eviction_finished(
+                                    eviction_request.request_id
+                                )
                             if evicted:
                                 logger.info(
                                     "Prefill LRU eviction completed for request %s",
@@ -590,6 +599,9 @@ class EngineCore:
                                     eviction_request.request_id,
                                 )
                         else:
+                            self.scheduler.prefill_eviction_finished(
+                                eviction_request.request_id
+                            )
                             logger.debug(
                                 "Prefill eviction requested for %s but no callback "
                                 "is configured",
@@ -674,6 +686,7 @@ class EngineCore:
         benchmark_trace: bool = False,
         benchmark_ane_sequence_length: int = 0,
         tools: list[dict[str, Any]] | None = None,
+        _owned_admission: Optional[OwnedAdmission] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -694,6 +707,13 @@ class EngineCore:
         Returns:
             The request ID
         """
+        if _owned_admission is not None:
+            if type(_owned_admission) is not OwnedAdmission:
+                raise ValueError("owned_admission_handle_required")
+            _owned_admission.validate(self, request_id, unused=True, deadline=True)
+            if request_id in self._output_collectors or request_id in self._finished_events:
+                raise ValueError("owned_admission_request_id_in_use")
+
         if request_id is None:
             request_id = str(uuid.uuid4())
 
@@ -756,10 +776,19 @@ class EngineCore:
         # the typed exception still reaches the FastAPI 400 handler.
         loop = asyncio.get_running_loop()
         try:
-            await loop.run_in_executor(
-                self._mlx_executor, self.scheduler.add_request, request
-            )
+            if _owned_admission is not None:
+                await _owned_admission.admit(self, request)
+            else:
+                await loop.run_in_executor(
+                    self._mlx_executor, self.scheduler.add_request, request
+                )
         except BaseException:
+            if _owned_admission is not None:
+                _owned_admission.cancel()
+                self._wake_engine_loop()
+                # Never abort before late admission or drop its ownership.
+                # The control coordinator must join then drain this handle.
+                raise
             # If the caller is cancelled here (e.g. the client disconnected
             # before the SSE stream began) — or the insert fails — the request
             # never reaches stream_outputs()/generate()'s try/finally, so
@@ -780,6 +809,243 @@ class EngineCore:
         self._wake_engine_loop()
 
         return request_id
+
+    def _synchronize_owned_stream(self, admission):
+        """Strict synchronization on the captured executor; never teardown."""
+        with admission._lock:
+            admission.validate(self, admission.binding.request_id)
+            if time.monotonic() >= admission._stream_effective_deadline:
+                raise TimeoutError("owned_stream_expired")
+            stream = admission.binding.stream
+        mx.synchronize(stream)
+        with admission._lock:
+            admission.validate(self, admission.binding.request_id)
+            if time.monotonic() >= admission._stream_effective_deadline:
+                raise TimeoutError("owned_stream_expired")
+        return stream
+
+    def _cleanup_owned_waiting_on_executor(self, admission):
+        admission.validate(self, admission.binding.request_id)
+        # 25b.4: one executor job classifies queued, decoding or chunked prefill.
+        fact = self.scheduler._cleanup_owned_request(admission)
+        if fact is None:
+            return None
+        admission.validate(self, admission.binding.request_id)
+        late = time.monotonic() >= admission._stream_effective_deadline
+        # A late fact still consumes its proof record, so it cannot hold a slot.
+        retained = self.scheduler._retain_consume_owned_waiting(admission, fact)
+        if retained is None:
+            # consume_mismatch is already recorded; do not relabel it.
+            return None
+        if late:
+            # The record is consumed, but a late fact is never left on the
+            # handle where a later stage could read it as success.
+            with admission._lock:
+                admission._cleanup_fact = None
+                admission._cleanup_outcome = "deadline"
+            return None
+        return retained
+
+    async def _owned_cleanup_waiting(self, admission, deadline):
+        """Owned cleanup stage for queued, decoding or chunked-prefill requests.
+
+        No collectors, device permit or stop ACK."""
+        if type(admission) is not OwnedAdmission:
+            return None
+        admission.cancel()
+        try:
+            effective = admission.pin_stream_deadline(self, deadline)
+        except ValueError:
+            return None
+        joined = await admission.join(self, effective)
+        if joined is None or joined.admission_failed or not joined.insertion_returned:
+            return None
+        with admission._lock:
+            try:
+                admission.validate(self, admission.binding.request_id)
+            except ValueError:
+                return None
+            if getattr(admission.binding.executor, "_max_workers", None) != 1:
+                admission._cleanup_outcome = "executor_not_serialized"
+                return None
+            if admission._stream_started:
+                admission._cleanup_outcome = "prior_stream_barrier"
+                return None
+            effective = admission._stream_effective_deadline
+            if time.monotonic() >= effective:
+                return None
+            if not admission._cleanup_started:
+                admission._cleanup_started = True
+                try:
+                    admission._cleanup_future = admission.binding.executor.submit(
+                        self._cleanup_owned_waiting_on_executor, admission
+                    )
+                    admission._cleanup_submitted_future = admission._cleanup_future
+                except Exception:
+                    admission._cleanup_outcome = "submission_failed"
+                    return None
+            future = admission._cleanup_future
+        if future is None:
+            return None
+        try:
+            await admission._wait(future, effective)
+        except (asyncio.CancelledError, Exception):
+            return None
+        with admission._lock:
+            try:
+                admission.validate(self, admission.binding.request_id)
+            except ValueError:
+                return None
+            if (
+                future is not admission._cleanup_future or future is not admission._cleanup_submitted_future
+                or not future.done() or future.cancelled() or future.exception() is not None
+                or time.monotonic() >= admission._stream_effective_deadline
+                or type(future.result()) not in (WaitingCleaned, RunningCleaned)
+                or future.result() is not admission._cleanup_fact
+            ):
+                return None
+            return future.result()
+
+    async def probe_owned_absence(self, admission, deadline):
+        """Classification-only absence probe on the MLX executor; never cleans.
+
+        Returns "absent", "finished_before_cleanup", "present" or "unknown".
+        ``deadline`` is the drain deadline, never the admission deadline. The
+        latest run and its future are kept on the handle, apart from the
+        cleanup fields, so a later stream barrier still runs and the probe
+        can run again.
+        """
+        if type(admission) is not OwnedAdmission:
+            return "unknown"
+        if (
+            not isinstance(deadline, (int, float))
+            or isinstance(deadline, bool)
+            or deadline != deadline
+            or deadline in (float("inf"), float("-inf"))
+        ):
+            return "unknown"
+        with admission._lock:
+            try:
+                admission.validate(self, admission.binding.request_id)
+            except ValueError:
+                return "unknown"
+            # A probe orders after its dispatch only on a serial executor.
+            if getattr(admission.binding.executor, "_max_workers", None) != 1:
+                return "unknown"
+            try:
+                future = admission.binding.executor.submit(
+                    self.scheduler._probe_owned_presence, admission
+                )
+            except Exception:
+                return "unknown"
+            admission._probe_future = future
+            admission._probe_result = None
+            admission._probe_dispatch = admission._future
+        try:
+            await admission._wait(future, deadline)
+        except (asyncio.CancelledError, Exception):
+            return "unknown"
+        with admission._lock:
+            if (
+                admission._probe_future is not future
+                or future.cancelled()
+                or future.exception() is not None
+            ):
+                return "unknown"
+            result = future.result()
+            if result not in ("absent", "finished_before_cleanup", "present"):
+                result = "unknown"
+            admission._probe_result = result
+            return result
+
+    def release_owned_failure(self, admission) -> bool:
+        """Drop what a failed owned add_request left behind (R1).
+
+        Only once the probe proved the request absent against the dispatch the
+        handle has now, that dispatch can no longer run, and admission never
+        returned; removes the collector, stream state and finished event with
+        defaults, since add_request may fail before creating them.
+        """
+        if type(admission) is not OwnedAdmission:
+            return False
+        with admission._lock:
+            try:
+                admission.validate(self, admission.binding.request_id)
+            except ValueError:
+                return False
+            future = admission.future
+            if (
+                admission._probe_result != "absent"
+                # A result taken before this dispatch existed proves nothing.
+                or admission._probe_dispatch is not future
+                # A returned dispatch admitted the request: never release it.
+                or admission._returned
+                or (future is not None and not future.done())
+            ):
+                return False
+        self._cleanup_request(admission.binding.request_id)
+        return True
+
+    async def _owned_stream_barrier(self, admission, deadline):
+        """Return a sync stage fact; this alone never establishes request stop."""
+        if type(admission) is not OwnedAdmission:
+            return None
+        try:
+            effective = admission.pin_stream_deadline(self, deadline)
+        except ValueError:
+            return None
+        if await admission.join(self, effective) is None:
+            return None
+        with admission._lock:
+            try:
+                admission.validate(self, admission.binding.request_id)
+            except ValueError:
+                return None
+            effective = admission._stream_effective_deadline
+            if time.monotonic() >= effective:
+                return None
+            if admission._cleanup_started and (
+                admission._cleanup_future is None or not admission._cleanup_future.done()
+                or admission._cleanup_future.cancelled()
+                or admission._cleanup_future.exception() is not None
+                or admission._cleanup_future.result() is not admission._cleanup_fact
+                or type(admission._cleanup_fact) not in (WaitingCleaned, RunningCleaned)
+            ):
+                return None
+            if not admission._stream_started:
+                admission._stream_started = True
+                try:
+                    admission._stream_future = admission.binding.executor.submit(
+                        self._synchronize_owned_stream, admission
+                    )
+                    admission._stream_submitted_future = admission._stream_future
+                except Exception:
+                    return None
+            future = admission._stream_future
+        if future is None:
+            return None
+        try:
+            await admission._wait(future, effective)
+        except (asyncio.CancelledError, Exception):
+            return None
+        with admission._lock:
+            try:
+                admission.validate(self, admission.binding.request_id)
+            except ValueError:
+                return None
+            if (
+                future is not admission._stream_future
+                or future is not admission._stream_submitted_future
+                or not future.done() or future.cancelled()
+                or time.monotonic() >= admission._stream_effective_deadline
+                or future.exception() is not None
+                or future.result() is not admission.binding.stream
+            ):
+                return None
+            return StreamSynchronized(
+                admission, future, admission.binding.generation_id,
+                admission.binding.request_id,
+            )
 
     async def abort_request(self, request_id: str) -> bool:
         """Abort a request.
@@ -1128,6 +1394,11 @@ class EngineCore:
             # Wait for the request to finish
             await event.wait()
         except asyncio.CancelledError:
+            if kwargs.get("_owned_admission") is not None:
+                # An owned request belongs to its coordinator, which cleans it
+                # up with proof; an ordinary abort here would race that.
+                logger.info(f"Owned request {request_id} cancelled; left to its coordinator")
+                raise
             # Client disconnected or task was cancelled - abort the request
             # to free scheduler/GPU resources (prevents orphaned requests)
             logger.info(f"Request {request_id} cancelled, aborting")

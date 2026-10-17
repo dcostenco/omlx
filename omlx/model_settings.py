@@ -339,6 +339,11 @@ class ModelSettings:
     # through mmap. The runtime may force this on when resident loading cannot
     # fit under the configured model-memory ceiling but mmap loading can.
     qwen4_ple_ssd_offload: bool = False
+    # Qwen4-Exp only: with SSD PLE, gather the next prefill chunk's rows on a
+    # host thread while the current chunk runs. Off, every row is read inside
+    # the forward that uses it (slower prefill); owned (Prism control) work
+    # requires it off.
+    qwen4_ple_gather_ahead: bool = True
     # Qwen4-Exp only: admit any canonical affine GDN projection recipe to the
     # fused one-row decode route, not only the oQe allow-list.
     qwen4_gdn_decode_wide_proj: bool = False
