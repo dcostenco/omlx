@@ -37,8 +37,10 @@ Requirements are upstream's: macOS 15.0+, Python 3.11–3.13, Apple Silicon.
 
 Then, for Prism:
 
-1. **Set an API key** in oMLX. Prism reads it from `OMLX_API_KEY` or
-   `~/.omlx/settings.json`.
+1. **Set an API key** in oMLX and keep the server bound to loopback
+   (`127.0.0.1`, the default). The control routes exist only when both hold;
+   otherwise Prism refuses every call. Prism reads the key from `OMLX_API_KEY`
+   or `~/.omlx/settings.json`.
 2. **Turn on chunked prefill**: `"scheduler": {"chunked_prefill": true}` in
    `~/.omlx/settings.json`. Without it, a cancel during a long prompt read
    cannot be confirmed, and Prism refuses later calls (`omlx_stop_unproved`,
