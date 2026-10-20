@@ -493,6 +493,13 @@ async def _terminate(execution, core, handle, final, submit_failures):
     outcome = await _terminal_facts(execution, core, handle, final)
     if submission_failures() != submit_failures:
         raise ExecutionUnresolved("host_read_ambiguous")
+    if outcome[0] in ("completed", "failed"):
+        # This consumer drained the final output, proved scheduler absence and
+        # stream synchronization, and ruled out ambiguous host submissions.
+        # Retire only its tracking, as stream_outputs does. Waiting for the
+        # orphan reaper keeps a completed classifier non-evictable during the
+        # next model's admission because has_active_requests sees its collector.
+        core._cleanup_request(execution.claim.request_id)
     return outcome
 
 
@@ -520,7 +527,7 @@ async def _terminal_facts(execution, core, handle, final):
     # The barrier's one job is submitted only now, after absence is proved.
     if type(await core._owned_stream_barrier(handle, deadline)) is not StreamSynchronized:
         raise ExecutionUnresolved("barrier_refused")
-    # The request was marked finished; the orphan reaper drops its collector.
+    # Tracking is retired by _terminate only after the host-read check too.
     if _is_error(final):
         return "failed", ("error_output", "absent_proved", "stream_synchronized")
     return "completed", ("finished_output", "absent_proved", "stream_synchronized")

@@ -51,11 +51,14 @@ Then, for Prism:
    example 256 tokens). Prism leaves thinking to oMLX's settings, so a model
    with no budget can answer with reasoning only, and Prism refuses that
    (`think_only`).
-5. **Leave room for the classifier beside your drafting model.** oMLX evicts an
-   idle model to fit another, but not one that has just answered. Measured on
-   a 48 GB Mac with a 27B 4-bit drafting model: a custom memory limit of 27 GB
-   with a 0.97 soft threshold kept both loaded for normal prompts; at 24 and
-   26 GB most drafts were refused.
+5. **Keep the normal soft memory watermark.** For example, a custom ceiling
+   of 27 GB with `soft_threshold: 0.90` lets oMLX evict the idle 9B classifier
+   before loading a 27B 4-bit drafting model. Owned completion now retires
+   the consumed request's collector after all stop proofs, so a classifier
+   that has just answered is immediately eligible for idle eviction. Raising
+   the soft threshold to keep both models resident can cause memory churn
+   during loading. The soft watermark controls idle eviction; the hard
+   ceiling and Prism's resource probes still apply.
 
 ## Known issue (upstream)
 
