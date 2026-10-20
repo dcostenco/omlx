@@ -733,6 +733,7 @@ def test_scheduler_exact_split_hit_reprefills_only_last_block():
 
     request = MagicMock()
     request.request_id = "exact-hit"
+    request._prism_owned_admission = None
     request.prompt_token_ids = list(range(12))
     request.vlm_extra_keys_for_cache = None
     request.vlm_extra_key_token_start_for_cache = None
