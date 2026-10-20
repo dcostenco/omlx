@@ -63,11 +63,14 @@ async def test_consumed_final_output_retires_busy_tracking_after_stop_proofs(mon
 async def test_completion_preserves_another_requests_collector(monkeypatch):
     core, engine, execution, handle = completed_request()
     other = RequestOutputCollector()
+    pending = SimpleNamespace(new_text="another request's queued response")
+    other.put(pending)
     core._output_collectors["other"] = other
     monkeypatch.setattr(prep, "_absent", AsyncMock())
     await prep._terminate(execution, core, handle, SimpleNamespace(error=None, finish_reason="stop"), prep.submission_failures())
     assert core._output_collectors == {"other": other}
     assert engine.has_active_requests(), "Another consumer still keeps this model busy"
+    assert other.get_nowait() is pending, "Retiring one response must not truncate another"
 
 
 @pytest.mark.asyncio
