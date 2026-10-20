@@ -2,8 +2,9 @@
 """Slice 27.4b CPU proof: the shared Responses preparation and the admission stage.
 
 Part 1 proves create_response's preparation block moved verbatim into
-_prepare_responses_chat (AST against the vendored upstream oMLX 0032173 route,
-the base the fork is merged onto).
+_prepare_responses_chat (AST against upstream oMLX v0.7.1 stable,
+bd1e9b112474862ebed550a9c83b4316038a1d74). The fixture preserves the route's
+signature and body; its HTTP decorator is omitted.
 Part 2 runs the real admission stage on the 25b harness: the real
 EngineCore.add_request owned branch, the real scheduler add_request, a real
 single-worker executor, the real probe, release, barrier and owned cleanup,
@@ -14,6 +15,7 @@ that drive the real core; the pool is a stub that leases one engine.
 import ast
 import asyncio
 import copy
+from hashlib import sha256
 import threading
 import time
 from types import MethodType, SimpleNamespace
@@ -32,7 +34,8 @@ from omlx.output_collector import RequestOutputCollector
 ROOT = waiting_fixture.ROOT
 admission_ns = waiting_fixture.stream_fixture.admission_fixture.ns
 BASELINE = (plumbing.Path if hasattr(plumbing, "Path") else __import__("pathlib").Path)(
-    __file__).with_name("omlx_create_response_0032173.py.txt")
+    __file__).with_name("responses_v0_7_1_bd1e9b1.py.txt")
+BASELINE_SHA256 = "5b9ed91092b969fa970fa15b6b60c941956e329b42e30780d8c9c6c6b0a3a0b2"
 RETURNED = (
     "messages", "chat_kwargs", "current_input_messages", "namespace_aliases",
     "response_format", "response_format_warning", "native_response_format",
@@ -47,6 +50,7 @@ def request(**fields):
 class PreparationMoveTests(unittest.TestCase):
     def setUp(self):
         self.new = ast.parse((ROOT / "omlx" / ("ser" + "ver.py")).read_text())
+        self.assertEqual(sha256(BASELINE.read_bytes()).hexdigest(), BASELINE_SHA256)
         old_module = ast.parse(BASELINE.read_text())
         self.old_route = next(n for n in old_module.body if isinstance(n, ast.AsyncFunctionDef))
         self.new_route = next(n for n in self.new.body

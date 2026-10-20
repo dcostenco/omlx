@@ -16,6 +16,8 @@ admission, cleanup, stream barriers, and the shared Responses preparation. Execu
 and scheduler boundaries use the checkout's actual method bodies with CPU fixtures;
 this does not establish real-GPU stop behavior or model quality.
 
-The three `omlx_*` fixtures preserve earlier Apache-2.0 source bodies for differential
-checks. Despite the historical filename, `omlx_create_response_0032173.py.txt` contains
-the v0.7.1 stable `bd1e9b112474862ebed550a9c83b4316038a1d74` Responses baseline.
+The Apache-2.0 fixture `responses_v0_7_1_bd1e9b1.py.txt` preserves the Responses
+route's signature and body from upstream v0.7.1 stable commit
+`bd1e9b112474862ebed550a9c83b4316038a1d74`, with the HTTP decorator omitted.
+The consuming test pins its SHA256 before comparing preparation bodies. The two
+`omlx_*` fixtures preserve earlier engine-method bodies for differential checks.
