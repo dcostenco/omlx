@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 import mlx.core as mx
 
+from . import gguf
 from .engine import BaseEngine, BatchedEngine
 from .engine.decision import DecisionEngine
 from .engine.embedding import EmbeddingEngine
@@ -43,6 +44,7 @@ from .engine.splash import (
     SplashTarget,
     find_splash_binary,
     resolve_splash_target,
+    splash_draft_to_download,
     splash_memory_estimate,
     splash_repo_id,
 )
@@ -61,8 +63,18 @@ from .exceptions import (
     ModelUnavailableError,
     describe_ceiling_binding,
 )
+from .host_submit import submission_failures
+from .owned_preparation import (
+    OwnedLease,
+    OwnedPreparationRefused,
+    owned_entry_refusal,
+    owned_family,
+    owned_loaded_variant_refusal,
+)
+from .owned_qwen4 import qwen4_instance_refusal_for_engine
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
+    detect_model_type,
     discover_models,
     format_size,
     is_realtime_stt_model,
@@ -90,6 +102,14 @@ from .utils.proc_memory import get_phys_footprint
 logger = logging.getLogger(__name__)
 
 
+def _gguf_model_root() -> Path | None:
+    """Where GGUF model folders are generated; None before settings load."""
+    try:
+        return get_global_settings().base_path / "gguf"
+    except RuntimeError:
+        return None
+
+
 def _touch_gpu() -> None:
     """Run one trivial kernel so the GPU stays out of its idle power state.
 
@@ -108,9 +128,52 @@ def _touch_gpu() -> None:
 # with a resident model still lets the GPU reach its idle power state.
 _GPU_KEEP_WARM_IDLE_WINDOW_S = 300.0
 
+# Claude Desktop tier alias slots. When ``ClaudeCodeSettings.desktop_enabled``
+# is set, oMLX exposes these slot IDs as derived (non-persisted) model IDs
+# that resolve at runtime to the models configured in the Claude Code tiers.
+# Each entry maps the public slot ID to the tier attribute name on the
+# Claude Code settings object (``opus_model`` / ``sonnet_model`` /
+# ``haiku_model``).
+CLAUDE_DESKTOP_TIER_SLOTS: tuple[tuple[str, str], ...] = (
+    ("claude-opus", "opus"),
+    ("claude-sonnet", "sonnet"),
+    ("claude-haiku", "haiku"),
+)
+
+# Anthropic family tier label exposed per slot in /v1/models metadata.
+CLAUDE_DESKTOP_TIER_FAMILY: dict[str, str] = {
+    "claude-opus": "opus",
+    "claude-sonnet": "sonnet",
+    "claude-haiku": "haiku",
+}
+
+
+def build_claude_tier_aliases(claude_code_settings) -> dict[str, str]:
+    """Build slot-ID -> tier-model map from Claude Code settings.
+
+    Returns an empty dict when ``desktop_enabled`` is falsy. Tiers with no
+    configured model (None/empty) are omitted, so their slot is neither
+    exposed nor resolved. Duck-typed on purpose: anything exposing
+    ``desktop_enabled`` / ``<tier>_model`` attributes works.
+    """
+    if claude_code_settings is None or not getattr(
+        claude_code_settings, "desktop_enabled", False
+    ):
+        return {}
+    aliases: dict[str, str] = {}
+    for slot_id, tier in CLAUDE_DESKTOP_TIER_SLOTS:
+        target = getattr(claude_code_settings, f"{tier}_model", None)
+        if target:
+            aliases[slot_id] = target
+    return aliases
+
+
 _FP16_BYTES = 2
 _MAX_AFFINE_BYTES_PER_WEIGHT = 1.0625  # q8 plus fp16 scale/bias per group
 _CPU_SHARE_MATERIALIZATION_HEADROOM = 1.5
+# Cluster ranks load the text model through mlx-lm, so a VLM-classified
+# checkpoint is served text-only while its deployment is active.
+_CLUSTER_ENGINE_TYPES = frozenset({"batched", "vlm"})
 
 
 def _positive_int(value: object) -> int:
@@ -278,6 +341,21 @@ def _set_decode_cap(scheduler: object, value: int) -> None:
         logger.warning("Live decode cap update failed", exc_info=True)
 
 
+def _owned_load_refusal_reason(exc: BaseException) -> str:
+    """A fixed reason for a pool error during owned preparation; no detail."""
+    for kind, reason in (
+        (ModelNotFoundError, "model_unknown"),
+        (ModelTooLargeError, "memory"),
+        (InsufficientMemoryError, "memory"),
+        (ModelBusyError, "busy"),
+        (ModelUnavailableError, "load_failed"),
+        (ModelLoadingError, "load_aborted"),
+    ):
+        if isinstance(exc, kind):
+            return reason
+    return "load_failed"
+
+
 @dataclass
 class EngineEntry:
     """Per-model state in the engine pool."""
@@ -328,6 +406,8 @@ class EngineEntry:
     source_type: str = "local"
     source_repo_id: str | None = None
     is_helper: bool = False  # Speculative-decoding drafter (dFlash/Assistant/MTP)
+    model_format: str | None = None  # "gguf": served by an external engine only
+    source_path: str | None = None  # The GGUF file a generated folder links to
     engine: (
         BaseEngine
         | EmbeddingEngine
@@ -352,6 +432,9 @@ class EngineEntry:
     # engine falls back, so identical requests keep reusing that fallback.
     runtime_settings_signature: tuple[tuple[str, str], ...] | None = None
     load_failed: bool = False  # Sticky until the next discovery refresh
+    # Set with the VLM-to-LLM fallback rewrite of engine_type and model_type,
+    # which outlives the engine; a fresh discovery entry does not carry it.
+    vlm_fallback_rewritten: bool = False
     load_failure_message: str | None = None
     load_failure_at: float | None = None
 
@@ -420,6 +503,8 @@ class EnginePool:
         self._unloading_models: set[str] = set()
         self._failed_load_reclaim_tasks: set[asyncio.Task[None]] = set()
         self._failed_load_reclaim_task: asyncio.Task[None] | None = None
+        # Owned preparation slow paths; held until done, never cancelled here.
+        self._owned_prepare_tasks: set[asyncio.Task] = set()
         self._shutting_down = False
         # Last logged forced-offload state per (model_id, kind).
         self._offload_warn_state: dict[tuple[str, str], bool] = {}
@@ -504,7 +589,7 @@ class EnginePool:
             deployment = getattr(entry.engine, "deployment", None)
             return deployment if isinstance(deployment, ClusterDeployment) else None
         registry = self._cluster_registry
-        if registry is None or entry.engine_type != "batched":
+        if registry is None or entry.engine_type not in _CLUSTER_ENGINE_TYPES:
             return None
         return registry.get_for_model(entry.model_path)
 
@@ -540,7 +625,7 @@ class EnginePool:
         base = self._entry_resident_size(entry) if base_size is None else base_size
         if self._distributed_deployment_for_entry(entry) is not None:
             return base
-        if getattr(runtime_settings, "external_engine", None):
+        if self.external_engine_id(entry.model_id, runtime_settings):
             # Splash plans its own budget; none of the MLX reservations apply.
             target, _ = self.splash_target(entry.model_id, runtime_settings)
             if target is not None:
@@ -1120,6 +1205,12 @@ class EnginePool:
         if entry is not None:
             qwen4_offload, _, _ = self._qwen4_ple_offload_status(entry, settings)
             add("qwen4_ple_ssd_offload", qwen4_offload)
+            # Read once at construction by every SSD-backed PLE table.
+            if (entry.config_model_type or "").replace("-", "_").lower() == "qwen4_exp":
+                add(
+                    "qwen4_ple_gather_ahead",
+                    bool(getattr(settings, "qwen4_ple_gather_ahead", True)),
+                )
             add(
                 "qwen4_gdn_decode_wide_proj",
                 getattr(settings, "qwen4_gdn_decode_wide_proj", False),
@@ -1143,6 +1234,7 @@ class EnginePool:
         turboquant_active = bool(data.get("turboquant_kv_enabled", False))
         add("turboquant_kv_enabled", turboquant_active)
         if turboquant_active:
+            add("turboquant_kv_scheme", data.get("turboquant_kv_scheme", "turboquant"))
             add("turboquant_kv_bits", data.get("turboquant_kv_bits", 4))
             add("turboquant_skip_last", data.get("turboquant_skip_last", True))
 
@@ -1351,10 +1443,11 @@ class EnginePool:
             dirs = [Path(d) for d in model_dirs]
         self._model_dirs = dirs
 
+        gguf_root = _gguf_model_root()
         if len(dirs) == 1:
-            discovered = discover_models(dirs[0])
+            discovered = discover_models(dirs[0], gguf_root)
         else:
-            discovered = discover_models_from_dirs(dirs)
+            discovered = discover_models_from_dirs(dirs, gguf_root)
 
         pinned_set = set(pinned_models or [])
 
@@ -1386,6 +1479,8 @@ class EnginePool:
                     source_type=getattr(info, "source_type", "local"),
                     source_repo_id=getattr(info, "source_repo_id", None),
                     is_helper=getattr(info, "is_helper", False),
+                    model_format=getattr(info, "model_format", None),
+                    source_path=getattr(info, "source_path", None),
                     is_pinned=model_id in pinned_set,
                 )
 
@@ -1404,6 +1499,13 @@ class EnginePool:
         ]
         for mid in stale:
             del self._entries[mid]
+        if gguf_root is not None:
+            # Loaded models keep their folder until they unload.
+            in_use = [
+                *(entry.model_path for entry in self._entries.values()),
+                *(info.model_path for info in discovered.values()),
+            ]
+            gguf.prune_model_folders(gguf_root, {Path(path).name for path in in_use})
 
         # Warn about pinned models not found
         found_models = set(self._entries.keys())
@@ -1569,10 +1671,10 @@ class EnginePool:
         if not matches:
             raise ModelNotFoundError(model_path, list(self._entries.keys()))
         model_id, entry = self._select_cluster_path_match(matches)
-        if entry.engine_type != "batched":
+        if entry.engine_type not in _CLUSTER_ENGINE_TYPES:
             raise ValueError(
                 f"Model '{model_id}' is a {entry.model_type} model. "
-                "Distributed cluster inference currently supports text LLM "
+                "Distributed cluster inference supports text generation "
                 "models only."
             )
         return model_id
@@ -1607,11 +1709,11 @@ class EnginePool:
         ]
         if exact:
             model_id, entry = self._select_cluster_path_match(exact)
-            if entry.engine_type != "batched":
+            if entry.engine_type not in _CLUSTER_ENGINE_TYPES:
                 raise ValueError(
                     f"Model '{model_id}' is already registered as "
                     f"{entry.model_type}; stop or remove that local model "
-                    "before activating it as a text cluster model."
+                    "before activating it as a cluster model."
                 )
             return model_id, False
 
@@ -1637,7 +1739,8 @@ class EnginePool:
         self._entries[model_id] = EngineEntry(
             model_id=model_id,
             model_path=str(path),
-            model_type="llm",
+            # Matches the local entry, so media input is refused the same way.
+            model_type="vlm" if detect_model_type(path) == "vlm" else "llm",
             engine_type="batched",
             estimated_size=int(estimated_size),
             config_model_type=str(config.get("model_type") or ""),
@@ -1719,7 +1822,12 @@ class EnginePool:
     ) -> None:
         """Drop stale unloaded entries whose backing model directory vanished."""
         model_path = Path(entry.model_path)
-        if model_path.exists() and (model_path / "config.json").exists():
+        source = entry.source_path
+        if (
+            model_path.exists()
+            and (model_path / "config.json").exists()
+            and (source is None or Path(source).exists())
+        ):
             return
 
         if entry.engine is None:
@@ -1770,14 +1878,23 @@ class EnginePool:
                 return mid
         return None
 
-    def resolve_model_id(self, model_id_or_alias: str, settings_manager) -> str:
+    def resolve_model_id(
+        self,
+        model_id_or_alias: str,
+        settings_manager,
+        claude_tier_aliases: dict[str, str] | None = None,
+    ) -> str:
         """Resolve a model alias to its actual model_id (directory name).
 
         Tries exact match in _entries first, then case-insensitive match,
         then active cluster deployment IDs, exposed profile model IDs, and
-        model settings aliases. If those fail and input contains a provider
-        prefix (e.g. "omlx/my-model"), strips the prefix and retries. Returns
-        the original string if no match is found.
+        model settings aliases. Claude Desktop tier aliases (derived at
+        runtime from the Claude Code tier models, passed via
+        ``claude_tier_aliases``) resolve AFTER exact directory matches and
+        custom ``model_alias`` entries, so a real model or user alias with
+        the same name always wins. If those fail and input contains a
+        provider prefix (e.g. "omlx/my-model"), strips the prefix and
+        retries. Returns the original string if no match is found.
         """
         if model_id_or_alias in self._entries:
             return model_id_or_alias
@@ -1818,6 +1935,13 @@ class EnginePool:
                 if ms.model_alias and ms.model_alias == model_id_or_alias:
                     return mid
 
+        # Claude Desktop tier aliases are derived at runtime and resolve only
+        # after exact directory matches and custom aliases.
+        if claude_tier_aliases:
+            tier_target = claude_tier_aliases.get(model_id_or_alias)
+            if tier_target is not None:
+                return tier_target
+
         # Strip provider prefix (e.g. "omlx/qwen3.5-35b" -> "qwen3.5-35b")
         if "/" in model_id_or_alias:
             stripped = model_id_or_alias.split("/", 1)[1]
@@ -1830,6 +1954,10 @@ class EnginePool:
                 for mid, ms in all_settings.items():
                     if ms.model_alias and ms.model_alias == stripped:
                         return mid
+            if claude_tier_aliases:
+                tier_target = claude_tier_aliases.get(stripped)
+                if tier_target is not None:
+                    return tier_target
 
         return model_id_or_alias
 
@@ -1942,6 +2070,19 @@ class EnginePool:
             self._splash_draft_candidates(model_settings),
         )
 
+    def splash_draft_to_download(
+        self, model_id: str, model_settings: object | None
+    ) -> str | None:
+        """The DFlash2 draft repo ``model_id`` lacks for Splash, or None."""
+        entry = self._entries.get(model_id)
+        if entry is None:
+            return None
+        return splash_draft_to_download(
+            entry.model_path,
+            get_global_settings().integrations.splash_path,
+            self._splash_draft_candidates(model_settings),
+        )
+
     def _splash_sizing_context(
         self, entry: EngineEntry, model_settings: object | None
     ) -> int | None:
@@ -2015,10 +2156,34 @@ class EnginePool:
             get_settings = getattr(self._settings_manager, "get_settings", None)
             if callable(get_settings):
                 settings = get_settings(model_id)
-        if getattr(settings, "external_engine", None):
+        if self.external_engine_id(model_id, settings):
             await asyncio.to_thread(
                 find_splash_binary, get_global_settings().integrations.splash_path
             )
+
+    async def external_engine_problem(
+        self, model_id: str, model_settings: object | None
+    ) -> str:
+        """Why no external engine can serve ``model_id``; empty when one can."""
+        await self._check_splash_launcher(model_id, model_settings)
+        _, reason = self.splash_target(model_id, model_settings)
+        return reason
+
+    def external_engine_id(
+        self, model_id: str, model_settings: object | None
+    ) -> str | None:
+        """The external engine that serves ``model_id``, else None.
+
+        A GGUF, which no in-process engine loads, falls back to the default
+        external engine when its settings pick none.
+        """
+        engine_id = getattr(model_settings, "external_engine", None)
+        if engine_id:
+            return engine_id
+        entry = self._entries.get(model_id)
+        if entry is not None and entry.model_format == "gguf":
+            return next(iter(EXTERNAL_ENGINES))
+        return None
 
     def _external_engine_for(
         self,
@@ -2031,7 +2196,7 @@ class EnginePool:
         A model that cannot run on its selected engine fails to load with the
         reason instead of falling back to MLX, since the user asked for it.
         """
-        engine_id = getattr(model_settings, "external_engine", None)
+        engine_id = self.external_engine_id(entry.model_id, model_settings)
         if not engine_id:
             return None
         if engine_id not in EXTERNAL_ENGINES:
@@ -2071,6 +2236,26 @@ class EnginePool:
         # Only an explicit limit goes to Splash; otherwise Splash fits the
         # context to its budget and the server adopts what it planned.
         requested_context = getattr(model_settings, "max_context_window", None)
+        budget = self._splash_memory_budget(entry, model_settings, target)
+        if requested_context and budget < splash_memory_estimate(
+            entry.model_path,
+            target.draft_path,
+            requested_context,
+            integrations.splash_kv_format,
+        ):
+            # The budget cannot hold the explicit limit (the room under the
+            # memory limit shrank, or splash_max_memory_gb is small), and
+            # Splash refuses to start on a limit it cannot hold. Without it
+            # Splash fits the context to the budget, and the server still
+            # caps prompts at the configured limit.
+            logger.warning(
+                "Splash: a %.1fGB budget cannot hold the %d-token context of "
+                "%s; letting Splash fit the context to the budget",
+                budget / 1024**3,
+                requested_context,
+                entry.model_id,
+            )
+            requested_context = None
         return SplashEngine(
             model_name=entry.model_path,
             model_id=entry.model_id,
@@ -2079,9 +2264,7 @@ class EnginePool:
             log_dir=settings.logging.get_log_dir(settings.base_path) / "splash",
             options=SplashOptions(
                 max_context=requested_context,
-                max_memory_bytes=self._splash_memory_budget(
-                    entry, model_settings, target
-                ),
+                max_memory_bytes=budget,
                 kv_format=integrations.splash_kv_format,
                 ane_prefill=integrations.splash_ane_prefill,
                 cache_disk_bytes=cache_disk_bytes,
@@ -2430,316 +2613,498 @@ class EnginePool:
         if ready is not None:
             return ready
         async with self._lock:
-            entry = self._entries.get(model_id)
-            if not entry:
-                raise ModelNotFoundError(model_id, list(self._entries.keys()))
-            if entry.pending_unload_reason:
-                raise ModelBusyError(model_id, "start work while unload is pending")
-            expected_signature = self._engine_runtime_signature(
-                model_id,
-                runtime_settings,
+            return await self._get_engine_locked(
+                model_id, force_lm, _lease, runtime_settings, reload_failed
             )
-            ngram_admission_ceiling = None
-            if (entry.config_model_type or "").replace("-", "_").lower() in {
-                "qwen4_exp",
-                "deepseek_v41",
-            }:
-                candidate = self._current_ceiling()
-                if candidate <= 0:
-                    candidate = self._fallback_admission_ceiling()
-                if candidate > 0:
-                    ngram_admission_ceiling = candidate
-            unloaded_for_admission = False
 
+    async def _get_engine_locked(
+        self,
+        model_id: str,
+        force_lm: bool,
+        _lease: bool,
+        runtime_settings: object | None,
+        reload_failed: bool,
+        *,
+        owned: bool = False,
+    ):
+        """The locked part of get_engine; the caller holds ``self._lock``.
+
+        With ``owned`` set (owned preparation), a loaded engine of another
+        runtime variant is refused instead of unloaded. Owned preparation
+        refuses that case before calling, so the flag is a defence.
+        """
+        entry = self._entries.get(model_id)
+        if not entry:
+            raise ModelNotFoundError(model_id, list(self._entries.keys()))
+        if entry.pending_unload_reason:
+            raise ModelBusyError(model_id, "start work while unload is pending")
+        expected_signature = self._engine_runtime_signature(
+            model_id,
+            runtime_settings,
+        )
+        ngram_admission_ceiling = None
+        if (entry.config_model_type or "").replace("-", "_").lower() in {
+            "qwen4_exp",
+            "deepseek_v41",
+        }:
+            candidate = self._current_ceiling()
+            if candidate <= 0:
+                candidate = self._fallback_admission_ceiling()
+            if candidate > 0:
+                ngram_admission_ceiling = candidate
+        unloaded_for_admission = False
+
+        if (
+            reload_failed
+            and entry.engine is not None
+            and self._runtime_failed_engine(entry.engine)
+        ):
+            logger.warning(
+                "Distributed runtime for %s is no longer serviceable (%s); "
+                "unloading it so this request reloads the deployment",
+                model_id,
+                getattr(entry.engine, "runtime_failed_reason", ""),
+            )
+            await self._unload_engine(model_id)
+            unloaded_for_admission = True
+
+        # Already loaded - just update access time
+        if entry.engine is not None:
             if (
-                reload_failed
-                and entry.engine is not None
-                and self._runtime_failed_engine(entry.engine)
+                expected_signature is not None
+                and entry.runtime_settings_signature is not None
+                and entry.runtime_settings_signature != expected_signature
+            ) or (
+                runtime_settings is not None
+                and entry.runtime_settings_signature is None
             ):
-                logger.warning(
-                    "Distributed runtime for %s is no longer serviceable (%s); "
-                    "unloading it so this request reloads the deployment",
+                if owned:
+                    raise OwnedPreparationRefused("variant_loaded")
+                self._raise_if_reload_busy(
+                    entry,
+                    "reload runtime settings variant",
+                )
+                logger.info(
+                    "Runtime settings variant changed for %s; "
+                    "unloading before reload.",
                     model_id,
-                    getattr(entry.engine, "runtime_failed_reason", ""),
                 )
                 await self._unload_engine(model_id)
                 unloaded_for_admission = True
-
-            # Already loaded - just update access time
-            if entry.engine is not None:
-                if (
-                    expected_signature is not None
-                    and entry.runtime_settings_signature is not None
-                    and entry.runtime_settings_signature != expected_signature
-                ) or (
-                    runtime_settings is not None
-                    and entry.runtime_settings_signature is None
-                ):
-                    self._raise_if_reload_busy(
-                        entry,
-                        "reload runtime settings variant",
-                    )
-                    logger.info(
-                        "Runtime settings variant changed for %s; "
-                        "unloading before reload.",
-                        model_id,
-                    )
-                    await self._unload_engine(model_id)
-                    unloaded_for_admission = True
-                # If force_lm requested but current engine is VLM, unload and reload
-                if (
-                    entry.engine is not None
-                    and force_lm
-                    and isinstance(entry.engine, VLMBatchedEngine)
-                ):
-                    self._raise_if_reload_busy(entry, "reload as LM")
-                    logger.info(
-                        f"Unloading VLM engine for {model_id} "
-                        f"(force_lm=True, reloading as LM)"
-                    )
-                    await self._unload_engine(model_id)
-                    unloaded_for_admission = True
-                elif entry.engine is not None:
-                    self._validate_llm_engine_ready(model_id, entry.engine)
-                    if entry.runtime_settings_signature is None:
-                        entry.runtime_settings_signature = expected_signature
-                    entry.last_access = time.time()
-                    if _lease:
-                        entry.in_use += 1
-                    return entry.engine
-
-            self._raise_if_model_path_missing_locked(model_id, entry)
-            self._raise_if_load_failed(model_id, entry)
-
-            # Pre-load admission against the memory ceiling from the
-            # process memory enforcer (min of static and dynamic). Try
-            # evicting LRU non-pinned models first; if the model still
-            # cannot fit after evicting everything available, raise.
-            #
-            # Eviction starts at the enforcer's *soft* watermark, not the
-            # ceiling (#2319): the soft..ceiling band is exactly the
-            # hard-pressure zone, and a second model admitted into it kept
-            # both models resident through the load (swapping for minutes)
-            # only to have the first request's prefill guard evict the old
-            # one anyway. Evicting down to the same soft target *before*
-            # the new weights allocate fixes the ordering; refusing a load
-            # still requires exceeding the ceiling.
-            #
-            # ceiling == 0 means the guard is disabled or the enforcer is
-            # not wired up. Eviction on model swap must not die with the
-            # guard (#2290): fall back to the best-effort admission
-            # ceiling (static, guard-independent) and keep evicting, but
-            # never refuse the load under it — with the guard off the
-            # user opted out of hard limits.
-            # A distributed coordinator admits only rank zero's planned shard,
-            # not the complete model. A local VLM-shaped checkpoint served by
-            # the text engine (force_lm or a model_type_override that flipped
-            # engine_type to "batched") loads only its language weights, so
-            # admit that path by the text-only estimate instead of the
-            # vision-inclusive file size (#2385).
-            deployment = self._distributed_deployment_for_entry(entry)
-            admission_size = self._entry_resident_size(entry)
+            # If force_lm requested but current engine is VLM, unload and reload
             if (
-                deployment is None
-                and entry.text_only_size
-                and (force_lm or entry.engine_type == "batched")
+                entry.engine is not None
+                and force_lm
+                and isinstance(entry.engine, VLMBatchedEngine)
             ):
-                admission_size = entry.text_only_size
-            admission_settings = runtime_settings
-            if admission_settings is None and self._settings_manager is not None:
-                get_settings = getattr(self._settings_manager, "get_settings", None)
-                if callable(get_settings):
-                    admission_settings = get_settings(model_id)
-            load_settings = self._effective_qwen4_model_settings(
-                entry,
-                admission_settings,
-                ceiling=ngram_admission_ceiling,
-            )
-            load_settings = self._effective_deepseek_v41_model_settings(
-                entry, load_settings, ceiling=ngram_admission_ceiling
-            )
-            ngram_admission_override = load_settings is not admission_settings
-            runtime_load_settings = (
-                load_settings if ngram_admission_override else runtime_settings
-            )
-            admission_size = self._entry_runtime_resident_size(
-                entry,
-                load_settings,
-                base_size=admission_size,
-            )
-            admission_kind = "local shard" if deployment is not None else "model"
+                self._raise_if_reload_busy(entry, "reload as LM")
+                logger.info(
+                    f"Unloading VLM engine for {model_id} "
+                    f"(force_lm=True, reloading as LM)"
+                )
+                await self._unload_engine(model_id)
+                unloaded_for_admission = True
+            elif entry.engine is not None:
+                self._validate_llm_engine_ready(model_id, entry.engine)
+                if entry.runtime_settings_signature is None:
+                    entry.runtime_settings_signature = expected_signature
+                entry.last_access = time.time()
+                if _lease:
+                    entry.in_use += 1
+                return entry.engine
 
-            ceiling = self._current_ceiling()
-            best_effort = False
-            if ceiling <= 0:
-                ceiling = self._fallback_admission_ceiling()
-                best_effort = ceiling > 0
-            if ceiling > 0:
-                soft_target = self._admission_soft_target()
-                evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
-                evicted_any = unloaded_for_admission
-                ceiling_rechecks = 0
-                while True:
-                    # Consult the tracked accumulator alongside live memory:
-                    # after a model settles or idles, mx.get_active_memory() and
-                    # the process footprint can read well below the model's true
-                    # resident size, while _current_model_memory still reflects
-                    # the committed total. Using only live memory lets a second
-                    # large model load without evicting the first, over-
-                    # committing past the ceiling (#1623).
-                    current = max(
-                        mx.get_active_memory(),
-                        _settled_phys_footprint(),
-                        self._current_model_memory,
+        self._raise_if_model_path_missing_locked(model_id, entry)
+        self._raise_if_load_failed(model_id, entry)
+
+        # Pre-load admission against the memory ceiling from the
+        # process memory enforcer (min of static and dynamic). Try
+        # evicting LRU non-pinned models first; if the model still
+        # cannot fit after evicting everything available, raise.
+        #
+        # Eviction starts at the enforcer's *soft* watermark, not the
+        # ceiling (#2319): the soft..ceiling band is exactly the
+        # hard-pressure zone, and a second model admitted into it kept
+        # both models resident through the load (swapping for minutes)
+        # only to have the first request's prefill guard evict the old
+        # one anyway. Evicting down to the same soft target *before*
+        # the new weights allocate fixes the ordering; refusing a load
+        # still requires exceeding the ceiling.
+        #
+        # ceiling == 0 means the guard is disabled or the enforcer is
+        # not wired up. Eviction on model swap must not die with the
+        # guard (#2290): fall back to the best-effort admission
+        # ceiling (static, guard-independent) and keep evicting, but
+        # never refuse the load under it — with the guard off the
+        # user opted out of hard limits.
+        # A distributed coordinator admits only rank zero's planned shard,
+        # not the complete model. A local VLM-shaped checkpoint served by
+        # the text engine (force_lm or a model_type_override that flipped
+        # engine_type to "batched") loads only its language weights, so
+        # admit that path by the text-only estimate instead of the
+        # vision-inclusive file size (#2385).
+        deployment = self._distributed_deployment_for_entry(entry)
+        admission_size = self._entry_resident_size(entry)
+        if (
+            deployment is None
+            and entry.text_only_size
+            and (force_lm or entry.engine_type == "batched")
+        ):
+            admission_size = entry.text_only_size
+        admission_settings = runtime_settings
+        if admission_settings is None and self._settings_manager is not None:
+            get_settings = getattr(self._settings_manager, "get_settings", None)
+            if callable(get_settings):
+                admission_settings = get_settings(model_id)
+        load_settings = self._effective_qwen4_model_settings(
+            entry,
+            admission_settings,
+            ceiling=ngram_admission_ceiling,
+        )
+        load_settings = self._effective_deepseek_v41_model_settings(
+            entry, load_settings, ceiling=ngram_admission_ceiling
+        )
+        ngram_admission_override = load_settings is not admission_settings
+        runtime_load_settings = (
+            load_settings if ngram_admission_override else runtime_settings
+        )
+        admission_size = self._entry_runtime_resident_size(
+            entry,
+            load_settings,
+            base_size=admission_size,
+        )
+        admission_kind = "local shard" if deployment is not None else "model"
+
+        ceiling = self._current_ceiling()
+        best_effort = False
+        if ceiling <= 0:
+            ceiling = self._fallback_admission_ceiling()
+            best_effort = ceiling > 0
+        if ceiling > 0:
+            soft_target = self._admission_soft_target()
+            evict_target = min(soft_target, ceiling) if soft_target > 0 else ceiling
+            evicted_any = unloaded_for_admission
+            ceiling_rechecks = 0
+            while True:
+                # Consult the tracked accumulator alongside live memory:
+                # after a model settles or idles, mx.get_active_memory() and
+                # the process footprint can read well below the model's true
+                # resident size, while _current_model_memory still reflects
+                # the committed total. Using only live memory lets a second
+                # large model load without evicting the first, over-
+                # committing past the ceiling (#1623).
+                current = max(
+                    mx.get_active_memory(),
+                    _settled_phys_footprint(),
+                    self._current_model_memory,
+                )
+                projected = current + admission_size
+                if projected <= evict_target:
+                    break
+                victim = self._find_lru_victim()
+                if victim is not None:
+                    logger.info(
+                        f"Evicting '{victim}' to fit '{model_id}' "
+                        f"under the admission soft target "
+                        f"({format_size(projected)} > "
+                        f"{format_size(evict_target)})"
                     )
-                    projected = current + admission_size
-                    if projected <= evict_target:
-                        break
-                    victim = self._find_lru_victim()
-                    if victim is not None:
+                    await self._unload_engine(victim)
+                    evicted_any = True
+                    continue
+                if projected <= ceiling:
+                    # Above the soft target with nothing left to
+                    # evict, but still under the ceiling: admit. The
+                    # soft target only decides when eviction starts
+                    # (#2319); refusal keeps the ceiling-only
+                    # contract.
+                    if evict_target < ceiling:
                         logger.info(
-                            f"Evicting '{victim}' to fit '{model_id}' "
-                            f"under the admission soft target "
+                            f"Admitting '{model_id}' above the "
+                            f"admission soft target with no idle "
+                            f"model left to evict "
                             f"({format_size(projected)} > "
-                            f"{format_size(evict_target)})"
+                            f"{format_size(evict_target)}, ceiling "
+                            f"{format_size(ceiling)})"
                         )
-                        await self._unload_engine(victim)
-                        evicted_any = True
-                        continue
-                    if projected <= ceiling:
-                        # Above the soft target with nothing left to
-                        # evict, but still under the ceiling: admit. The
-                        # soft target only decides when eviction starts
-                        # (#2319); refusal keeps the ceiling-only
-                        # contract.
-                        if evict_target < ceiling:
-                            logger.info(
-                                f"Admitting '{model_id}' above the "
-                                f"admission soft target with no idle "
-                                f"model left to evict "
-                                f"({format_size(projected)} > "
-                                f"{format_size(evict_target)}, ceiling "
-                                f"{format_size(ceiling)})"
-                            )
-                        break
-                    failure_current = current
-                    failure_projected = projected
-                    failure_label = "current"
+                    break
+                failure_current = current
+                failure_projected = projected
+                failure_label = "current"
 
-                    if evicted_any:
-                        # Nothing else to evict after unloading at least one
-                        # model in this get_engine() call. Before failing,
-                        # re-test against the *tracked committed* baseline.
-                        # The phys_footprint term folded into `current` is the
-                        # macOS kernel ledger, which can still count
-                        # reclaimable residue from models we just evicted.
-                        # Pinned/in-use models that could not be evicted remain
-                        # counted in _current_model_memory, preserving the
-                        # #1623 undercount guard. Without a local eviction,
-                        # keep trusting phys_footprint because it may be
-                        # unrelated process pressure rather than model residue.
-                        committed = max(
-                            mx.get_active_memory(), self._current_model_memory
-                        )
-                        committed_projected = committed + admission_size
-                        if committed_projected <= ceiling:
-                            logger.info(
-                                f"Admitting '{model_id}': committed baseline "
-                                f"{format_size(committed_projected)} fits ceiling "
-                                f"{format_size(ceiling)} "
-                                f"(live footprint {format_size(projected)} included "
-                                "reclaimable residue from evicted models)"
-                            )
-                            break
-                        failure_current = committed
-                        failure_projected = committed_projected
-                        failure_label = "committed"
-
-                    if best_effort:
-                        # Memory guard is off: evicting was all we could
-                        # do. Admit over the static ceiling instead of
-                        # refusing, matching the unguarded no-hard-limit
-                        # contract.
-                        logger.warning(
-                            f"Loading '{model_id}' past the static memory "
-                            f"ceiling with the memory guard disabled "
-                            f"(projected {format_size(failure_projected)} > "
-                            f"ceiling {format_size(ceiling)}, "
-                            f"{failure_label} baseline) and nothing left to "
-                            f"evict; the system may swap heavily."
+                if evicted_any:
+                    # Nothing else to evict after unloading at least one
+                    # model in this get_engine() call. Before failing,
+                    # re-test against the *tracked committed* baseline.
+                    # The phys_footprint term folded into `current` is the
+                    # macOS kernel ledger, which can still count
+                    # reclaimable residue from models we just evicted.
+                    # Pinned/in-use models that could not be evicted remain
+                    # counted in _current_model_memory, preserving the
+                    # #1623 undercount guard. Without a local eviction,
+                    # keep trusting phys_footprint because it may be
+                    # unrelated process pressure rather than model residue.
+                    committed = max(
+                        mx.get_active_memory(), self._current_model_memory
+                    )
+                    committed_projected = committed + admission_size
+                    if committed_projected <= ceiling:
+                        logger.info(
+                            f"Admitting '{model_id}': committed baseline "
+                            f"{format_size(committed_projected)} fits ceiling "
+                            f"{format_size(ceiling)} "
+                            f"(live footprint {format_size(projected)} included "
+                            "reclaimable residue from evicted models)"
                         )
                         break
+                    failure_current = committed
+                    failure_projected = committed_projected
+                    failure_label = "committed"
 
-                    if (
-                        ceiling_rechecks < _ADMISSION_CEILING_RECHECKS
-                        and self._dynamic_ceiling_binds()
-                    ):
-                        # Pages of a model unloaded just before this load
-                        # reach the free list up to ~0.2s after the process
-                        # footprint drops, so the dynamic ceiling can read
-                        # low for that long. Re-read it before refusing.
-                        ceiling_rechecks += 1
-                        await asyncio.sleep(_ADMISSION_CEILING_RECHECK_S)
-                        ceiling = max(ceiling, self._current_ceiling())
-                        soft_target = max(soft_target, self._admission_soft_target())
-                        evict_target = (
-                            min(soft_target, ceiling) if soft_target > 0 else ceiling
-                        )
-                        continue
+                if best_effort:
+                    # Memory guard is off: evicting was all we could
+                    # do. Admit over the static ceiling instead of
+                    # refusing, matching the unguarded no-hard-limit
+                    # contract.
+                    logger.warning(
+                        f"Loading '{model_id}' past the static memory "
+                        f"ceiling with the memory guard disabled "
+                        f"(projected {format_size(failure_projected)} > "
+                        f"ceiling {format_size(ceiling)}, "
+                        f"{failure_label} baseline) and nothing left to "
+                        f"evict; the system may swap heavily."
+                    )
+                    break
 
-                    # Still over budget under the applicable baseline. Use
-                    # ModelTooLargeError when the model alone exceeds the
-                    # ceiling (no chance of fitting), InsufficientMemoryError
-                    # when current usage leaves no room.
-                    if admission_size > ceiling:
-                        binding, advice = self._ceiling_binding_and_advice(
-                            ceiling=ceiling,
-                            current=failure_current,
-                            tail="use a smaller model",
-                        )
-                        raise ModelTooLargeError(
-                            model_id,
-                            admission_size,
-                            ceiling,
-                            binding=binding,
-                            advice=advice,
-                        )
+                if (
+                    ceiling_rechecks < _ADMISSION_CEILING_RECHECKS
+                    and self._dynamic_ceiling_binds()
+                ):
+                    # Pages of a model unloaded just before this load
+                    # reach the free list up to ~0.2s after the process
+                    # footprint drops, so the dynamic ceiling can read
+                    # low for that long. Re-read it before refusing.
+                    ceiling_rechecks += 1
+                    await asyncio.sleep(_ADMISSION_CEILING_RECHECK_S)
+                    ceiling = max(ceiling, self._current_ceiling())
+                    soft_target = max(soft_target, self._admission_soft_target())
+                    evict_target = (
+                        min(soft_target, ceiling) if soft_target > 0 else ceiling
+                    )
+                    continue
+
+                # Still over budget under the applicable baseline. Use
+                # ModelTooLargeError when the model alone exceeds the
+                # ceiling (no chance of fitting), InsufficientMemoryError
+                # when current usage leaves no room.
+                if admission_size > ceiling:
                     binding, advice = self._ceiling_binding_and_advice(
                         ceiling=ceiling,
                         current=failure_current,
-                        tail="unload another model",
+                        tail="use a smaller model",
                     )
-                    label = f"{binding} memory ceiling" if binding else "memory ceiling"
-                    raise InsufficientMemoryError(
-                        required=admission_size,
-                        current=failure_current,
-                        message=(
-                            f"Cannot load {model_id}: projected memory "
-                            f"{format_size(failure_projected)} would exceed "
-                            f"the {label} {format_size(ceiling)} "
-                            f"({failure_label}: {format_size(failure_current)}, "
-                            f"{admission_kind}: {format_size(admission_size)}). "
-                            f"{advice or DEFAULT_CEILING_ADVICE}."
-                        ),
+                    raise ModelTooLargeError(
+                        model_id,
+                        admission_size,
+                        ceiling,
+                        binding=binding,
+                        advice=advice,
                     )
+                binding, advice = self._ceiling_binding_and_advice(
+                    ceiling=ceiling,
+                    current=failure_current,
+                    tail="unload another model",
+                )
+                label = f"{binding} memory ceiling" if binding else "memory ceiling"
+                raise InsufficientMemoryError(
+                    required=admission_size,
+                    current=failure_current,
+                    message=(
+                        f"Cannot load {model_id}: projected memory "
+                        f"{format_size(failure_projected)} would exceed "
+                        f"the {label} {format_size(ceiling)} "
+                        f"({failure_label}: {format_size(failure_current)}, "
+                        f"{admission_kind}: {format_size(admission_size)}). "
+                        f"{advice or DEFAULT_CEILING_ADVICE}."
+                    ),
+                )
 
-            # Now load the model
-            await self._load_engine(
-                model_id,
-                force_lm=force_lm,
-                runtime_settings=runtime_load_settings,
+        # Now load the model
+        await self._load_engine(
+            model_id,
+            force_lm=force_lm,
+            runtime_settings=runtime_load_settings,
+        )
+
+        loaded = self._entries[model_id]
+        if ngram_admission_override and expected_signature is not None:
+            # Automatic mmap is local to this admission attempt. Keep the
+            # user's requested variant as the reuse key so the next request
+            # does not reload the model merely because pressure recovered.
+            loaded.runtime_settings_signature = expected_signature
+        self._validate_llm_engine_ready(model_id, loaded.engine)
+        if _lease:
+            loaded.in_use += 1
+        return loaded.engine
+
+
+    async def _owned_fence(self, fence) -> None:
+        """Run the execution's fence; any refusal is an owned refusal."""
+        try:
+            await fence()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise OwnedPreparationRefused("fence") from None
+
+    def _raise_owned_refusal(self, model_id: str) -> EngineEntry:
+        """Pre-load refusals from the exact entry and its persisted settings."""
+        entry = self._entries.get(model_id)
+        settings = None
+        if entry is not None and self._settings_manager is not None:
+            get_settings = getattr(self._settings_manager, "get_settings", None)
+            if callable(get_settings):
+                settings = get_settings(model_id)
+        reason = owned_entry_refusal(
+            entry,
+            settings,
+            distributed=(
+                entry is not None
+                and self._distributed_deployment_for_entry(entry) is not None
+            ),
+            diffusion=entry is not None and self._entry_is_diffusion_model(entry),
+            signature=lambda: self._engine_runtime_signature(model_id, settings),
+            submit_failures=submission_failures(),
+        )
+        if reason is not None:
+            raise OwnedPreparationRefused(reason)
+        return entry
+
+    async def _release_owned_locked(self, model_id: str) -> None:
+        """Drop one owned lease while this task holds ``self._lock``."""
+        entry = self._entries.get(model_id)
+        if entry is not None and entry.in_use > 0:
+            entry.in_use -= 1
+            entry.last_access = time.time()
+        await self._unload_pending_if_idle_locked(model_id)
+
+    def _owned_identity_holds(self, model_id, engine, expected) -> bool:
+        """Exact class and types as configured; never a subclass or fallback."""
+        entry = self._entries.get(model_id)
+        engine_type, model_type = expected
+        engine_class = {"batched": BatchedEngine, "vlm": VLMBatchedEngine}[engine_type]
+        return (
+            entry is not None
+            and entry.engine is engine
+            and type(engine) is engine_class
+            and (entry.engine_type, entry.model_type) == expected
+            and not entry.vlm_fallback_rewritten
+            and entry.runtime_settings_signature
+            == self._engine_runtime_signature(model_id, None)
+        )
+
+    async def _acquire_owned_locked(self, model_id: str, fence, expected):
+        """The slow path: fence after the lock wait, then load without fallback."""
+        async with self._lock:
+            await self._owned_fence(fence)
+            entry = self._raise_owned_refusal(model_id)
+            if (entry.engine_type, entry.model_type) != expected:
+                raise OwnedPreparationRefused("fallback_engine")
+            if entry.pending_unload_reason or model_id in self._unloading_models:
+                raise OwnedPreparationRefused("pending_unload")
+            if entry.is_loading:
+                raise OwnedPreparationRefused("loading")
+            loaded_signature = entry.runtime_settings_signature
+            expected_signature = self._engine_runtime_signature(model_id, None)
+            if (
+                entry.engine is not None
+                and loaded_signature is not None
+                and expected_signature is not None
+                and loaded_signature != expected_signature
+            ):
+                # Owned work never unloads another variant (get_engine would).
+                raise OwnedPreparationRefused("variant_loaded")
+            before = self._failed_load_reclaim_task
+            try:
+                engine = await self._get_engine_locked(
+                    model_id, False, True, None, False, owned=True
+                )
+            except OwnedPreparationRefused:
+                raise
+            except Exception as exc:
+                after = self._failed_load_reclaim_task
+                raise OwnedPreparationRefused(
+                    _owned_load_refusal_reason(exc),
+                    reclaim=after if after is not before else None,
+                ) from None
+            if not self._owned_identity_holds(model_id, engine, expected):
+                await self._release_owned_locked(model_id)
+                raise OwnedPreparationRefused("fallback_engine")
+            return engine
+
+    async def _owned_model_refusal(self, engine) -> str | None:
+        """The 25b.4 model-level refusal, on the engine's own MLX thread."""
+        core = self._resolve_engine_core_from_engine(engine)
+        scheduler = getattr(core, "scheduler", None)
+        executor = getattr(core, "_mlx_executor", None)
+        refusal = getattr(scheduler, "_owned_model_refusal", None)
+        if executor is None or not callable(refusal):
+            return "engine_unavailable"
+        return await asyncio.get_running_loop().run_in_executor(executor, refusal)
+
+    async def _owned_instance_refusal(self, model_id: str, engine) -> str | None:
+        """28: the loaded model itself, for a Qwen4-Exp owned admission."""
+        if owned_family(self._entries.get(model_id)) != "qwen4_exp":
+            return None
+        core = self._resolve_engine_core_from_engine(engine)
+        executor = getattr(core, "_mlx_executor", None)
+        if executor is None:
+            return "engine_unavailable"
+        return await asyncio.get_running_loop().run_in_executor(
+            executor, qwen4_instance_refusal_for_engine, engine
+        )
+
+    async def acquire_owned(self, model_id: str, *, fence) -> OwnedLease:
+        """Exact-model engine acquisition for owned control execution.
+
+        No alias, profile, runtime settings, default model or forced LM; every
+        setting that lets a load serve something else is refused first. The
+        fence runs before acquisition, after the pool lock wait and after the
+        load. Returns a lease the caller releases exactly once, or raises
+        OwnedPreparationRefused; any lease taken here is released before that.
+        """
+        await self._owned_fence(fence)
+        entry = self._raise_owned_refusal(model_id)
+        expected = (entry.engine_type, entry.model_type)
+        engine = self._acquire_loaded_engine(model_id, False, True, None)
+        if engine is not None:
+            if not self._owned_identity_holds(model_id, engine, expected):
+                await self.release_engine(model_id)
+                raise OwnedPreparationRefused("fallback_engine")
+        else:
+            task = asyncio.get_running_loop().create_task(
+                self._acquire_owned_locked(model_id, fence, expected),
+                name=f"engine-owned-prepare:{model_id}",
             )
-
-            loaded = self._entries[model_id]
-            if ngram_admission_override and expected_signature is not None:
-                # Automatic mmap is local to this admission attempt. Keep the
-                # user's requested variant as the reuse key so the next request
-                # does not reload the model merely because pressure recovered.
-                loaded.runtime_settings_signature = expected_signature
-            self._validate_llm_engine_ready(model_id, loaded.engine)
-            if _lease:
-                loaded.in_use += 1
-            return loaded.engine
+            self._owned_prepare_tasks.add(task)
+            task.add_done_callback(self._owned_prepare_tasks.discard)
+            # Shielded: a load is never cancelled from here.
+            engine = await asyncio.shield(task)
+        try:
+            # The recorded signature, not the settings: it is what was built.
+            variant = owned_loaded_variant_refusal(self._entries.get(model_id))
+            if variant is not None:
+                raise OwnedPreparationRefused(variant)
+            if await self._owned_model_refusal(engine) is not None:
+                raise OwnedPreparationRefused("model_entangled")
+            instance = await self._owned_instance_refusal(model_id, engine)
+            if instance is not None:
+                logger.info("Owned admission refused for %s: %s", model_id, instance)
+                raise OwnedPreparationRefused("model_entangled")
+            await self._owned_fence(fence)
+        except BaseException:
+            await self.release_engine(model_id)
+            raise
+        return OwnedLease(model_id, engine)
 
     async def _release_engine_lease(self, model_id: str) -> None:
         # A normal completed request need not wait behind unrelated teardown.
@@ -3030,9 +3395,9 @@ class EnginePool:
                         continue
                     if not ane_release_attempted:
                         # Last rung before giving up: shed the requesting
-                        # model's own ANE prefill banks. They hold the packed
-                        # weight blobs mapped into the native programs (~13 GB
-                        # for a 27B at the default fractions) and are purely
+                        # model's own ANE prefill banks. The ANE driver wires
+                        # their program weights during prefill (~7 GiB for a
+                        # 27B at the default fractions) and they are purely
                         # an accelerator — the per-module failure-latch
                         # fallback serves the same modules on GPU — so at
                         # long context the trade is a slower-but-unthrottled
@@ -3240,12 +3605,10 @@ class EnginePool:
     ) -> int:
         """Release the requesting model's ANE prefill banks; report bytes freed.
 
-        The compiled banks keep the packed weight blobs mapped into the
-        native ANE programs for the model's whole residency, so a config
-        tuned at a short calibration length silently competes with the KV
-        cache at long context — on a 27B at mlp 0.35 / gdn 0.45 the banks
-        hold ~13 GB, which is the difference between full 2048-token prefill
-        chunks and the guard throttling to the floor. Shedding them is safe:
+        The ANE driver wires the banks' program weights during every
+        prefill (about 7 GiB on a 27B at the default split), which the
+        admission estimate reserves on top of the KV cache at long context.
+        Shedding them is safe:
         the release latches every sliced module through the existing
         per-module failure flags, so the dispatch sites fall back to stock
         GPU compute exactly as they do after a warmup failure. The banks are
@@ -3315,8 +3678,8 @@ class EnginePool:
             )
             return 0
         freed = max(0, before - get_phys_footprint())
-        # The load-time admission reservation priced these I/O surfaces; drop
-        # it so later passes stop pausing for memory that no longer exists.
+        # The load-time admission reservation priced these program weights;
+        # drop it so later passes stop pausing for memory that no longer exists.
         # The next load re-prices it from the rebuilt banks.
         monitor = getattr(getattr(core, "scheduler", None), "memory_monitor", None)
         if monitor is not None and hasattr(monitor, "clear_ane_prefill_transient"):
@@ -3795,7 +4158,7 @@ class EnginePool:
 
             # An external engine replaces every in-process engine.
             engine = self._external_engine_for(entry, model_settings, effective_type)
-            deployment = deployment if effective_type == "batched" else None
+            deployment = deployment if effective_type in _CLUSTER_ENGINE_TYPES else None
             # Decision models never decode, so speculative decoding settings
             # saved for the same checkpoint do not apply.
             if (
@@ -3872,6 +4235,7 @@ class EnginePool:
                             model_settings, "enable_thinking", None
                         ),
                         model_settings=model_settings,
+                        vision_checkpoint=entry.model_type == "vlm",
                     )
                     logger.info(
                         "Distributed inference enabled for %s: ranks=%d "
@@ -4011,6 +4375,7 @@ class EnginePool:
 
                     entry.model_type = "llm"
                     entry.engine_type = "batched"
+                    entry.vlm_fallback_rewritten = True
                     effective_type = "batched"
                     logger.info(
                         f"Successfully loaded {model_id} as LLM (fallback from VLM)"
@@ -4371,6 +4736,8 @@ class EnginePool:
                     "reasoning_efforts": e.reasoning_efforts,
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
+                    "model_format": e.model_format,
+                    "source_path": e.source_path,
                     "last_access": e.last_access if e.last_access > 0 else None,
                 }
             )

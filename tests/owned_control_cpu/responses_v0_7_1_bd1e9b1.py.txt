@@ -1,0 +1,530 @@
+# SPDX-License-Identifier: Apache-2.0
+async def create_response(
+    request: ResponsesRequest,
+    http_request: FastAPIRequest,
+    _: bool = Depends(verify_inference_api_key),
+):
+    """Create a response (OpenAI Responses API)."""
+    _reject_lone_surrogates(request)
+    if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with oQ quantization. Please try again after quantization completes.",
+        )
+
+    logger.debug(
+        f"Responses API request: model={request.model}, stream={request.stream}"
+    )
+
+    load_start = time.perf_counter()
+    lease = _LLMEngineLease()
+    try:
+        engine = await get_engine_for_model(request.model, lease=lease)
+        model_load_duration = time.perf_counter() - load_start
+
+        resolved_model = _serving_model_id(lease, request.model)
+
+        # Images in function_call_output lists survive only for engines that
+        # can extract them; text engines get a placeholder instead so base64
+        # payloads never reach the prompt (#2989).
+        preserve_tool_images = _engine_accepts_images(engine)
+
+        current_input_messages = convert_responses_input_to_messages(
+            request.input,
+            consolidate_system_messages=False,
+            preserve_images=preserve_tool_images,
+        )
+
+        # Build previous context from previous_response_id
+        previous_messages = None
+        if request.previous_response_id:
+            previous_messages = _resolve_previous_response_messages(
+                request.previous_response_id
+            )
+
+        # Convert Responses API input → internal messages
+        messages = convert_responses_input_to_messages(
+            request.input,
+            request.instructions,
+            previous_messages,
+            consolidate_system_messages=False,
+            preserve_images=preserve_tool_images,
+        )
+
+        # Convert tools: flat → nested. namespace_aliases maps each expanded
+        # namespace member's wire name back for the return path.
+        namespace_aliases: dict = {}
+        openai_tools = convert_responses_tools(request.tools, namespace_aliases)
+        apply_namespace_tool_aliases(messages, namespace_aliases)
+        if (
+            getattr(engine, "is_diffusion_model", False)
+            and not getattr(engine, "supports_tool_calling", False)
+            and openai_tools
+        ):
+            raise InvalidRequestError(
+                "Tool calling is not supported for this diffusion model "
+                "(no tool parser matched its chat template).",
+                field="tools",
+            )
+
+        # Get per-model settings
+        reasoning_parser = None
+        ms = get_model_settings_for_request(request.model)
+        if ms:
+            reasoning_parser = ms.reasoning_parser
+        merged_ct_kwargs = merge_chat_template_request_kwargs(
+            ms,
+            merge_reasoning_effort_chat_template_kwargs(
+                request.chat_template_kwargs,
+                (
+                    request.reasoning.get("effort")
+                    if isinstance(request.reasoning, dict)
+                    else None
+                ),
+            ),
+        )
+
+        # Auto-set enable_thinking when a positive thinking budget is active.
+        # Set it before grammar compilation, which reads the thinking state.
+        thinking_budget = _resolve_thinking_budget(request, request.model)
+        if (
+            thinking_budget is not None
+            and thinking_budget > 0
+            and "enable_thinking" not in merged_ct_kwargs
+        ):
+            merged_ct_kwargs["enable_thinking"] = True
+
+        _entry = get_engine_pool().get_entry(resolved_model)
+
+        # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
+        # are NOT called here because convert_responses_input_to_messages() already
+        # returns plain dicts in {"role": str, "content": str} format.
+        # Those extract functions expect Pydantic Message objects from OpenAI/Anthropic requests.
+
+        # Handle text.format (structured output)
+        response_format = None
+        compiled_grammar = None
+        response_format_warning = None
+        native_response_format = None
+        if request.text and request.text.format:
+            fmt = request.text.format
+            if fmt.type == "json_object":
+                response_format = {"type": "json_object"}
+            elif fmt.type == "json_schema":
+                response_format = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": fmt.name or "response",
+                        "schema": fmt.schema_ or {},
+                        "strict": fmt.strict or False,
+                    },
+                }
+            if response_format:
+                from .api.openai_models import ResponseFormat
+
+                _reject_diffusion_structured_outputs(
+                    engine,
+                    response_format=response_format,
+                )
+                native_response_format = _native_response_format(
+                    engine, response_format
+                )
+                if native_response_format is None:
+                    await engine.start()
+                    reasoning_parser = _grammar_reasoning_parser(
+                        engine, reasoning_parser
+                    )
+                    rf = ResponseFormat(**response_format)
+                    compiled_grammar = _compile_grammar_for_request(
+                        engine,
+                        response_format=rf,
+                        chat_template_kwargs=merged_ct_kwargs or None,
+                        reasoning_parser=reasoning_parser,
+                    )
+                if native_response_format is None and compiled_grammar is None:
+                    # Non-strict formats still degrade to prompt injection, so
+                    # surface it to the caller with the same Warning response
+                    # header /v1/chat/completions uses; the log line alone only
+                    # ever reaches the operator (#1241).
+                    response_format_warning = _response_format_warning_header(rf)
+                    json_instruction = build_json_system_prompt(rf)
+                    if json_instruction:
+                        messages = _inject_json_instruction(messages, json_instruction)
+            else:
+                compiled_grammar = None
+
+        # Merge MCP tools, matching create_chat_completion's tools_disabled
+        # semantics: tool_choice="none" suppresses tool exposure to the chat
+        # template, and the MCP merge itself must run even when the client
+        # sent no tools of its own, since MCP servers can offer tools the
+        # client never listed.
+        tools_disabled = request.tool_choice == "none" or (
+            getattr(engine, "is_diffusion_model", False)
+            and not getattr(engine, "supports_tool_calling", False)
+        )
+        effective_tools = None if tools_disabled else openai_tools
+        if (
+            _server_state.mcp_manager
+            and not tools_disabled
+            and mcp_tools_exposed()
+        ):
+            effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
+
+        # Convert tools for chat template
+        tools_for_template = (
+            convert_tools_for_template(effective_tools) if effective_tools else None
+        )
+        # Resolve template defaults before preparing the prompt for reuse.
+        native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
+        if (
+            native_reasoning
+            and merged_ct_kwargs.get("enable_thinking") is not False
+            and "preserve_thinking" not in merged_ct_kwargs
+        ):
+            merged_ct_kwargs["preserve_thinking"] = True
+
+        # Gemma 4 drops required params that lack descriptions — enrich them
+        if tools_for_template and "gemma" in (resolved_model or "").lower():
+            tools_for_template = enrich_tool_params_for_gemma4(tools_for_template)
+        await _ensure_tokenizer_for_system_probe(engine, messages)
+        messages = prepare_system_messages_for_template(
+            messages,
+            engine.tokenizer,
+            tools=tools_for_template,
+            chat_template_kwargs=merged_ct_kwargs or None,
+            is_partial=False,
+            unsupported_mid_system_policy=_unsupported_mid_system_policy(),
+        )
+
+        # Validate context window
+        try:
+            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+                engine,
+                messages,
+                tools_for_template,
+                chat_template_kwargs=merged_ct_kwargs or None,
+            )
+        except Exception as e:
+            err_name = type(e).__name__.lower()
+            err_msg = str(e).lower()
+            if (
+                "template" in err_name
+                or "template" in err_msg
+                or isinstance(e, (AssertionError, ValueError))
+            ):
+                raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
+            raise
+        validate_context_window(num_prompt_tokens, request.model)
+
+        # Build sampling kwargs
+        (
+            temperature,
+            top_p,
+            top_k,
+            repetition_penalty,
+            min_p,
+            presence_penalty,
+            frequency_penalty,
+            max_tokens,
+            xtc_probability,
+            xtc_threshold,
+        ) = get_sampling_params(
+            request.temperature,
+            request.top_p,
+            request.model,
+            req_top_k=getattr(request, "top_k", None),
+            req_repetition_penalty=getattr(request, "repetition_penalty", None),
+            req_max_tokens=request.max_output_tokens,
+        )
+        chat_kwargs = {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "repetition_penalty": repetition_penalty,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+            "xtc_probability": xtc_probability,
+            "xtc_threshold": xtc_threshold,
+        }
+
+        # Widen the repetition-penalty look-back window when the client
+        # asks for it (mlx-lm default window is 20 tokens).
+        repetition_context_size = getattr(
+            request, "repetition_context_size", None
+        )
+        if repetition_context_size is not None:
+            chat_kwargs["repetition_context_size"] = repetition_context_size
+
+        # Add seed for reproducible generation (best-effort)
+        if request.seed is not None:
+            chat_kwargs["seed"] = request.seed
+
+        # Add thinking budget if applicable
+        if thinking_budget is not None:
+            chat_kwargs["thinking_budget"] = thinking_budget
+
+        if prepared_prompt is not None:
+            chat_kwargs["_prepared_prompt"] = prepared_prompt
+
+        # Add compiled grammar for logit-level structured output.
+        if compiled_grammar is not None:
+            chat_kwargs["compiled_grammar"] = compiled_grammar
+            if reasoning_parser and "thinking_budget" not in chat_kwargs:
+                default_budget = min(max_tokens // 2, 4096)
+                chat_kwargs["thinking_budget"] = default_budget
+                logger.debug(
+                    "Auto-set thinking_budget=%d for grammar-constrained request",
+                    default_budget,
+                )
+
+        if tools_for_template:
+            chat_kwargs["tools"] = tools_for_template
+        if merged_ct_kwargs:
+            chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
+        chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
+            ms,
+            native_reasoning=uses_native_reasoning_content(
+                resolved_model,
+                config_model_type=getattr(_entry, "config_model_type", None),
+                engine_model_type=getattr(engine, "model_type", None),
+                preserve_thinking_default=getattr(
+                    _entry, "preserve_thinking_default", None
+                ),
+            ),
+            chat_template_kwargs=merged_ct_kwargs,
+        )
+
+        # Pre-flight prefill memory guard — must precede any StreamingResponse
+        # return so PrefillMemoryExceededError can be mapped to HTTP 400.
+        await _raise_if_llm_lease_abort_requested(lease)
+        await engine.preflight_chat(
+            messages,
+            request_id=http_request.headers.get("x-request-id"),
+            **chat_kwargs,
+        )
+        await _raise_if_llm_lease_abort_requested(lease)
+        inference_request_id = str(uuid.uuid4())
+        chat_kwargs["_request_id"] = inference_request_id
+
+        if request.stream:
+            sse_headers = {
+                "X-Accel-Buffering": "no",
+                "Cache-Control": "no-cache",
+                _REQUEST_ID_HEADER: inference_request_id,
+            }
+            if response_format_warning:
+                sse_headers["Warning"] = response_format_warning
+            stream_state = _ResponsesStreamState()
+            return StreamingResponse(
+                _release_after_stream(
+                    _with_request_disconnect_abort(
+                        _with_sse_keepalive(
+                            stream_responses_api(
+                                engine,
+                                messages,
+                                request,
+                                input_messages=current_input_messages,
+                                store_response=_should_store_response(request.store),
+                                model_load_duration=model_load_duration,
+                                resolved_model=resolved_model,
+                                response_format=response_format,
+                                native_reasoning=native_reasoning,
+                                namespace_aliases=namespace_aliases,
+                                stream_state=stream_state,
+                                **chat_kwargs,
+                            ),
+                            http_request=http_request,
+                            keepalive_chunk=_resolve_keepalive(
+                                "openai_responses", responses_state=stream_state
+                            ),
+                        ),
+                        http_request,
+                        engine,
+                        inference_request_id,
+                    ),
+                    lease,
+                ),
+                media_type="text/event-stream",
+                headers=sse_headers,
+            )
+
+        # Engines that enforce response_format themselves get it with the
+        # request; the stream path adds it in stream_responses_api.
+        if native_response_format is not None:
+            chat_kwargs["response_format"] = native_response_format
+
+        # Non-streaming with keepalive during prefill
+        async def _build_responses_api():
+            await _raise_if_llm_lease_abort_requested(lease)
+            start_time = time.perf_counter()
+            output = await engine.chat(messages=messages, **chat_kwargs)
+
+            elapsed = time.perf_counter() - start_time
+            tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+            logger.info(
+                f"Responses API: model={resolved_model}, "
+                f"{output.completion_tokens} tokens in {elapsed:.2f}s "
+                f"({tokens_per_sec:.1f} tok/s)"
+            )
+
+            first_token_at = getattr(output, "first_token_at", None)
+            prefill_duration = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
+            gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
+            get_server_metrics().record_request_complete(
+                prompt_tokens=output.prompt_tokens,
+                completion_tokens=output.completion_tokens,
+                cached_tokens=output.cached_tokens,
+                prefill_duration=prefill_duration,
+                generation_duration=gen_duration,
+                model_id=resolved_model,
+                request_duration=elapsed,
+            )
+
+            # Process output text
+            raw_text = clean_special_tokens(output.text) if output.text else ""
+            thinking_content, regular_content = extract_thinking(
+                raw_text,
+                truncated=output.finish_reason == "length",
+                start_in_thinking=(
+                    output.finish_reason == "length"
+                    and _chat_prompt_opens_thinking(engine, messages, chat_kwargs)
+                ),
+            )
+
+            # Parse tool calls
+            if output.tool_calls:
+                tool_calls = _convert_parser_tool_calls(output.tool_calls)
+                cleaned_text = regular_content
+                cleaned_thinking = sanitize_tool_call_markup(
+                    thinking_content, engine.tokenizer
+                )
+            else:
+                extraction = extract_tool_calls_with_thinking(
+                    thinking_content,
+                    regular_content,
+                    tokenizer=engine.tokenizer,
+                    tools=tools_for_template,
+                    finish_reason=output.finish_reason,
+                )
+                cleaned_text = extraction.cleaned_text
+                tool_calls = extraction.tool_calls
+                recovered = _nonstream_recovery_text(
+                    extraction,
+                    regular_content,
+                    output,
+                    engine.tokenizer,
+                    tools_for_template,
+                )
+                if recovered is not None:
+                    cleaned_text = recovered
+                elif failure := _tool_call_failure(extraction):
+                    raise _ToolCallGenerationError(failure["error"])
+                cleaned_thinking = extraction.cleaned_thinking
+
+            # Reverse Gemma 4 parameter renaming
+            if tool_calls and "gemma" in (resolved_model or "").lower():
+                for tc in tool_calls:
+                    fn = getattr(tc, "function", None)
+                    if fn and fn.arguments:
+                        try:
+                            args = json.loads(fn.arguments)
+                            args = restore_gemma4_param_names(args)
+                            fn.arguments = json.dumps(args, ensure_ascii=False)
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+
+            # Process response_format if specified
+            if response_format and not tool_calls:
+                cleaned_text, _, is_valid, error = parse_json_output(
+                    cleaned_text or regular_content, response_format
+                )
+                if not is_valid:
+                    logger.warning(f"JSON validation failed: {error}")
+
+            # Build output items
+            output_items: list[OutputItem] = []
+            reasoning_text = (cleaned_thinking or "").strip()
+            if reasoning_text:
+                output_items.append(build_reasoning_output_item(reasoning_text))
+            output_items.append(
+                build_message_output_item(cleaned_text.strip() if cleaned_text else "")
+            )
+
+            if tool_calls:
+                for tc in tool_calls:
+                    if hasattr(tc, "function"):
+                        call_id = tc.id
+                        name = tc.function.name
+                        arguments = tc.function.arguments
+                    elif isinstance(tc, dict):
+                        call_id = tc.get(
+                            "call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
+                        )
+                        name = tc.get("name", "")
+                        arguments = tc.get("arguments", "{}")
+                    else:
+                        continue
+                    namespace, name = split_namespace_tool_name(name, namespace_aliases)
+                    output_items.append(
+                        build_function_call_output_item(
+                            name=name,
+                            arguments=arguments,
+                            call_id=call_id,
+                            namespace=namespace,
+                        )
+                    )
+
+            reasoning_token_count = (
+                len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0
+            )
+            usage = build_response_usage(
+                input_tokens=output.prompt_tokens,
+                output_tokens=output.completion_tokens,
+                reasoning_tokens=reasoning_token_count,
+                cached_tokens=output.cached_tokens,
+            )
+
+            # Surface max_output_tokens truncation so clients can tell an
+            # incomplete turn from a natural stop. The Responses API has no
+            # finish_reason field; status + incomplete_details is the signal.
+            truncated = getattr(output, "finish_reason", None) == "length"
+            response_obj = ResponseObject(
+                model=request.model,
+                status="incomplete" if truncated else "completed",
+                output=output_items,
+                usage=usage,
+                tools=request.tools or [],
+                tool_choice=request.tool_choice or "auto",
+                temperature=temperature,
+                top_p=top_p,
+                max_output_tokens=request.max_output_tokens,
+                previous_response_id=request.previous_response_id,
+                incomplete_details={"reason": "max_output_tokens"} if truncated else None,
+            )
+
+            # Store response
+            if _should_store_response(request.store):
+                _store_response_state(
+                    response_obj.model_dump(exclude_none=True),
+                    input_messages=current_input_messages,
+                )
+
+            return response_obj.model_dump_json()
+
+        json_headers = {_REQUEST_ID_HEADER: inference_request_id}
+        if response_format_warning:
+            json_headers["Warning"] = response_format_warning
+        return await _json_response_or_keepalive(
+            http_request, _build_responses_api(), lease=lease, headers=json_headers
+        )
+
+    except BaseException:
+        await lease.release()
+        raise

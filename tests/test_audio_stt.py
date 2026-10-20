@@ -259,6 +259,7 @@ def server_audio_client():
         mock_state.hf_downloader = None
         mock_state.ms_downloader = None
         mock_state.mcp_manager = None
+        mock_state.prism_control_coordinator = None
         mock_state.api_key = None
         mock_state.settings_manager = MagicMock()
         mock_state.settings_manager.resolve_model_id = MagicMock(
@@ -1272,6 +1273,7 @@ class TestSTTModelAliasResolution:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
+            mock_state.prism_control_coordinator = None
             mock_state.api_key = None
             mock_state.settings_manager = MagicMock()
             with TestClient(app, raise_server_exceptions=False) as client:
@@ -1305,6 +1307,7 @@ class TestSTTModelAliasResolution:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
+            mock_state.prism_control_coordinator = None
             mock_state.api_key = None
             mock_state.settings_manager = MagicMock()
             with TestClient(app, raise_server_exceptions=False) as client:

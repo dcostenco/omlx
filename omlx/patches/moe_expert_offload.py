@@ -52,6 +52,7 @@ from mlx_lm.models.switch_layers import (
 
 from ..custom_kernels.moe_staging import EXPERTS, MAX_BYTES, Staging
 from ..custom_kernels.moe_staging import NATIVE_AVAILABLE as STAGING_AVAILABLE
+from ..host_submit import submit_tracked
 from ..scheduler import _sync_and_clear_cache
 
 logger = logging.getLogger(__name__)
@@ -439,12 +440,22 @@ class ExpertCache:
         return out
 
     def _submit(self, pool, e: int) -> list:
-        """Start reading expert ``e``; a task per tensor keeps its reads parallel."""
+        """Start reading expert ``e``; a task per tensor keeps its reads parallel.
+
+        Each future is recorded before the next submission, so a failed
+        submission drains the reads already started before it re-raises.
+        """
         read = self._staging.read if self._staging else CheckpointExpertStore.read
-        return [
-            (name, field, plan, pool.submit(read, plan))
-            for name, field, plan in self._plans(e)
-        ]
+        group = []
+        try:
+            for name, field, plan in self._plans(e):
+                group.append(
+                    (name, field, plan, submit_tracked(pool, read, plan))
+                )
+        except BaseException:
+            _drain({e: group})
+            raise
+        return group
 
     def _reserve(self, protected=frozenset()) -> int:
         """Claim a slot, evicting the lowest-count expert outside ``protected``."""
@@ -510,11 +521,16 @@ class ExpertCache:
         out: dict[int, list] = {}
         if pool is None:
             return out
-        for e in dict.fromkeys(int(e) for e in ids):
-            if len(out) >= limit:
-                break
-            if e not in self.slot_of:
-                out[e] = self._submit(pool, e)
+        try:
+            for e in dict.fromkeys(int(e) for e in ids):
+                if len(out) >= limit:
+                    break
+                if e not in self.slot_of:
+                    out[e] = self._submit(pool, e)
+        except BaseException:
+            # The caller never receives a partial dict; drain it here.
+            _drain(out)
+            raise
         return out
 
     def _ensure_ids(self, ids, on_slow_read=None, pending=None) -> bool:

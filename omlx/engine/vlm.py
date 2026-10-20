@@ -49,6 +49,7 @@ from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
 from ..models.vlm import VLMModelAdapter
+from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.mlx_lm_mtp import drafter_target
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
@@ -2473,6 +2474,9 @@ class VLMBatchedEngine(BaseEngine):
                             True,
                         ),
                         install_dispatch=False,
+                        packed_projections=qwen35_packed_linear.enabled(
+                            self._vlm_model
+                        ),
                     )
 
                 ane_count = await loop.run_in_executor(
@@ -2486,8 +2490,6 @@ class VLMBatchedEngine(BaseEngine):
         # the M5 tensor units. Replaces the layers in place, so resident
         # memory does not grow; runs on the MLX executor before any forward.
         try:
-            from ..patches import qwen35_packed_linear
-
             if qwen35_packed_linear.enabled(self._vlm_model):
                 packed = await loop.run_in_executor(
                     get_mlx_executor(),
@@ -2615,11 +2617,18 @@ class VLMBatchedEngine(BaseEngine):
                 apply_turboquant_attention_patch()
                 tq_bits = float(getattr(self._model_settings, "turboquant_kv_bits", 4))
                 scheduler._turboquant_kv_bits = tq_bits
+                scheduler._turboquant_kv_scheme = getattr(
+                    self._model_settings, "turboquant_kv_scheme", "turboquant"
+                )
                 scheduler._turboquant_skip_last = getattr(
                     self._model_settings, "turboquant_skip_last", True
                 )
                 scheduler._set_model_info_for_monitor()
-                logger.info(f"TurboQuant KV cache enabled for VLM: {tq_bits} bits")
+                logger.info(
+                    "KV cache compression enabled for VLM: %s, %s bits",
+                    scheduler._turboquant_kv_scheme,
+                    tq_bits,
+                )
 
         # head_dim=256 long-context prefill -> O(L) tiled SDPA kernel. See
         # batched.py for rationale. Passthrough-safe; strictly gated route.
@@ -2773,8 +2782,8 @@ class VLMBatchedEngine(BaseEngine):
                         scheduler,
                         requested_ane_sequence_length,
                     )
-                    # Price the compiled I/O surfaces off the full model so
-                    # admission charges them while the banks are resident.
+                    # Price the compiled program weights off the full model
+                    # so admission charges them while the banks are resident.
                     monitor = getattr(scheduler, "memory_monitor", None)
                     if monitor is not None:
                         monitor.set_ane_prefill_transient_bytes(
@@ -4886,6 +4895,7 @@ class VLMBatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
@@ -4907,6 +4917,85 @@ class VLMBatchedEngine(BaseEngine):
             tool_calls=output.tool_calls,
             cached_tokens=output.cached_tokens,
             first_token_at=output.first_token_at,
+        )
+
+    def _stream_request_arguments(
+        self,
+        prompt,
+        max_tokens,
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        repetition_penalty,
+        presence_penalty,
+        stop,
+        vlm_inputs_embeds,
+        vlm_extra_kwargs,
+        vlm_image_hash,
+        vlm_cache_key_start,
+        vlm_cache_key_ranges,
+        kwargs,
+    ) -> dict[str, Any]:
+        """stream_generate's SamplingParams and add_request arguments.
+
+        Shared with owned admission so both build the same request. Pops from
+        ``kwargs`` exactly as stream_generate always did.
+        """
+        # OCR models: add extra stop token IDs to prevent degeneration.
+        # Sampling params (temperature, repetition_penalty, max_tokens) are
+        # resolved by get_sampling_params() with OCR defaults as a fallback
+        # layer, so admin/API overrides are respected.
+        extra_stop_ids: list[int] = []
+        if self.is_ocr_model:
+            extra_stop_ids = self._resolve_ocr_stop_token_ids()
+
+        from ..request import SamplingParams
+
+        sampling_params = SamplingParams(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            xtc_probability=kwargs.get("xtc_probability", 0.0),
+            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
+            repetition_penalty=repetition_penalty,
+            repetition_context_size=kwargs.get("repetition_context_size"),
+            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
+            ngram_window=kwargs.get("ngram_window", 0),
+            presence_penalty=presence_penalty,
+            frequency_penalty=kwargs.get("frequency_penalty", 0.0),
+            stop=stop or [],
+            stop_token_ids=extra_stop_ids or None,
+            thinking_budget=kwargs.get("thinking_budget", None),
+            compiled_grammar=kwargs.get("compiled_grammar", None),
+            seed=kwargs.get("seed", None),
+            stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
+            logits_observer=kwargs.get("logits_observer"),
+        )
+
+        # SpecPrefill: pass per-request overrides
+        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        tools = kwargs.pop("tools", None)
+
+        return dict(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            request_id=kwargs.pop("_request_id", None),
+            vlm_inputs_embeds=vlm_inputs_embeds,
+            vlm_extra_kwargs=vlm_extra_kwargs,
+            vlm_image_hash=vlm_image_hash,
+            vlm_cache_key_start=vlm_cache_key_start,
+            vlm_cache_key_ranges=vlm_cache_key_ranges,
+            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
+            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
+            benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
+            benchmark_ane_sequence_length=int(
+                kwargs.get("benchmark_ane_sequence_length", 0) or 0
+            ),
+            tools=tools,
+            **specprefill_kwargs,
         )
 
     async def stream_generate(
@@ -4964,62 +5053,25 @@ class VLMBatchedEngine(BaseEngine):
                 yield output
             return
 
-        # OCR models: add extra stop token IDs to prevent degeneration.
-        # Sampling params (temperature, repetition_penalty, max_tokens) are
-        # resolved by get_sampling_params() with OCR defaults as a fallback
-        # layer, so admin/API overrides are respected.
-        extra_stop_ids: list[int] = []
-        if self.is_ocr_model:
-            extra_stop_ids = self._resolve_ocr_stop_token_ids()
-
-        from ..request import SamplingParams
-
-        sampling_params = SamplingParams(
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            min_p=min_p,
-            xtc_probability=kwargs.get("xtc_probability", 0.0),
-            xtc_threshold=kwargs.get("xtc_threshold", 0.1),
-            repetition_penalty=repetition_penalty,
-            repetition_context_size=kwargs.get("repetition_context_size"),
-            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
-            ngram_window=kwargs.get("ngram_window", 0),
-            presence_penalty=presence_penalty,
-            frequency_penalty=kwargs.get("frequency_penalty", 0.0),
-            stop=stop or [],
-            stop_token_ids=extra_stop_ids or None,
-            thinking_budget=kwargs.get("thinking_budget", None),
-            compiled_grammar=kwargs.get("compiled_grammar", None),
-            seed=kwargs.get("seed", None),
-            stop_skips_reasoning=kwargs.get("stop_skips_reasoning", False),
-            logits_observer=kwargs.get("logits_observer"),
+        arguments = self._stream_request_arguments(
+            prompt,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            presence_penalty,
+            stop,
+            vlm_inputs_embeds,
+            vlm_extra_kwargs,
+            vlm_image_hash,
+            vlm_cache_key_start,
+            vlm_cache_key_ranges,
+            kwargs,
         )
-
-        # SpecPrefill: pass per-request overrides
-        specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
-        tools = kwargs.pop("tools", None)
-
         engine = self._engine
-        request_id = await engine.add_request(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=kwargs.pop("_request_id", None),
-            vlm_inputs_embeds=vlm_inputs_embeds,
-            vlm_extra_kwargs=vlm_extra_kwargs,
-            vlm_image_hash=vlm_image_hash,
-            vlm_cache_key_start=vlm_cache_key_start,
-            vlm_cache_key_ranges=vlm_cache_key_ranges,
-            skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
-            preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
-            benchmark_trace=bool(kwargs.get("benchmark_trace", False)),
-            benchmark_ane_sequence_length=int(
-                kwargs.get("benchmark_ane_sequence_length", 0) or 0
-            ),
-            tools=tools,
-            **specprefill_kwargs,
-        )
+        request_id = await engine.add_request(**arguments)
 
         finished_normally = False
         try:
@@ -5312,6 +5364,117 @@ class VLMBatchedEngine(BaseEngine):
             request_id=request_id,
         )
 
+    async def _stream_chat_prompt(self, messages, tools, kwargs):
+        """stream_chat's prompt and VLM inputs, as passed to stream_generate.
+
+        Shared with owned admission. Runs _process_chat_messages on the MLX
+        executor and mutates ``kwargs`` exactly as stream_chat always did.
+        """
+        # Run vision encoding on the MLX executor thread to avoid blocking
+        # the event loop.  Blocking here (synchronous mx.eval) prevents
+        # uvicorn from managing HTTP keep-alive connections, causing
+        # TransferEncodingError on the next request (issue #80).
+        loop = asyncio.get_running_loop()
+        # _process_chat_messages pops these; the tail marker needs them too.
+        ct_kwargs = kwargs.get("chat_template_kwargs")
+        partial = kwargs.get("is_partial")
+        (
+            prompt,
+            vlm_embeds,
+            vlm_kwargs,
+            image_hash,
+            image_cache_key_start,
+            image_cache_key_ranges,
+        ) = await loop.run_in_executor(
+            self._engine._mlx_executor,
+            self._process_chat_messages,
+            messages,
+            tools,
+            kwargs,
+        )
+
+        # SpecPrefill: protect the system-prompt region from token dropping.
+        self._inject_specprefill_system_end(messages, prompt, kwargs)
+        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
+        if generation_prompt:
+            kwargs["generation_prompt_text"] = generation_prompt
+            kwargs["generation_prompt_persists"] = persists
+        return prompt, dict(
+            vlm_inputs_embeds=vlm_embeds,
+            vlm_extra_kwargs=vlm_kwargs,
+            vlm_image_hash=image_hash,
+            vlm_cache_key_start=image_cache_key_start,
+            vlm_cache_key_ranges=image_cache_key_ranges,
+        )
+
+    async def admit_owned_chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        admission,
+        request_id: str,
+        max_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        presence_penalty: float = 0.0,
+        tools: list[dict] | None = None,
+        **kwargs,
+    ) -> None:
+        """Owned admission with exactly stream_chat's request.
+
+        The prompt, VLM inputs, sampling parameters and add_request arguments
+        come from the helpers stream_chat and stream_generate use; the request
+        is admitted through the trusted handle under the claim's request ID.
+        Returns when admission returns. Never aborts and attaches no output
+        reader: the control coordinator owns the request from here.
+        """
+        if not self._loaded:
+            raise RuntimeError("owned_admission_engine_not_loaded")
+        if self.is_diffusion_model:
+            raise RuntimeError("owned_admission_diffusion_unsupported")
+        # stream_chat would reject these by name; never drop them silently.
+        clash = sorted(
+            {
+                "prompt",
+                "vlm_inputs_embeds",
+                "vlm_extra_kwargs",
+                "vlm_image_hash",
+                "vlm_cache_key_start",
+                "vlm_cache_key_ranges",
+            }
+            & kwargs.keys()
+        )
+        if clash:
+            raise TypeError(f"owned_admission_unexpected_arguments: {clash}")
+        prompt, vlm = await self._stream_chat_prompt(messages, tools, kwargs)
+        # stream_chat hands these to stream_generate as keywords.
+        stop = kwargs.pop("stop", None)
+        kwargs["tools"] = tools
+        arguments = self._stream_request_arguments(
+            prompt,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            repetition_penalty,
+            presence_penalty,
+            stop,
+            vlm["vlm_inputs_embeds"],
+            vlm["vlm_extra_kwargs"],
+            vlm["vlm_image_hash"],
+            vlm["vlm_cache_key_start"],
+            vlm["vlm_cache_key_ranges"],
+            kwargs,
+        )
+        if arguments["request_id"] is not None:
+            raise ValueError("owned_admission_request_id_conflict")
+        arguments["request_id"] = request_id
+        await self._engine.add_request(**arguments, _owned_admission=admission)
+
     async def stream_chat(
         self,
         messages: list[dict[str, Any]],
@@ -5358,31 +5521,7 @@ class VLMBatchedEngine(BaseEngine):
         # the event loop.  Blocking here (synchronous mx.eval) prevents
         # uvicorn from managing HTTP keep-alive connections, causing
         # TransferEncodingError on the next request (issue #80).
-        loop = asyncio.get_running_loop()
-        # _process_chat_messages pops these; the tail marker needs them too.
-        ct_kwargs = kwargs.get("chat_template_kwargs")
-        partial = kwargs.get("is_partial")
-        (
-            prompt,
-            vlm_embeds,
-            vlm_kwargs,
-            image_hash,
-            image_cache_key_start,
-            image_cache_key_ranges,
-        ) = await loop.run_in_executor(
-            self._engine._mlx_executor,
-            self._process_chat_messages,
-            messages,
-            tools,
-            kwargs,
-        )
-
-        # SpecPrefill: protect the system-prompt region from token dropping.
-        self._inject_specprefill_system_end(messages, prompt, kwargs)
-        generation_prompt, persists = self._generation_prompt_text(ct_kwargs, partial)
-        if generation_prompt:
-            kwargs["generation_prompt_text"] = generation_prompt
-            kwargs["generation_prompt_persists"] = persists
+        prompt, vlm = await self._stream_chat_prompt(messages, tools, kwargs)
 
         async for output in self.stream_generate(
             prompt=prompt,
@@ -5393,11 +5532,7 @@ class VLMBatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
-            vlm_inputs_embeds=vlm_embeds,
-            vlm_extra_kwargs=vlm_kwargs,
-            vlm_image_hash=image_hash,
-            vlm_cache_key_start=image_cache_key_start,
-            vlm_cache_key_ranges=image_cache_key_ranges,
+            **vlm,
             tools=tools,
             **kwargs,
         ):

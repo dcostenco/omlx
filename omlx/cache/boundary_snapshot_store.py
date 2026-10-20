@@ -617,8 +617,11 @@ class BoundarySnapshotSSDStore:
                 return True
         return False
 
-    def cleanup_request(self, request_id: str) -> None:
+    def cleanup_request(self, request_id: str, *, strict: bool = False) -> None:
         """Delete all snapshot files and pending writes for a request.
+
+        ``strict=True`` refuses writer timeout, unsafe paths and deletion
+        failures instead of allowing legacy best-effort cleanup to return.
 
         Caller must guarantee no async store_cache worker is still reading
         snapshots for this request — concurrent ``rmtree`` here would race
@@ -698,13 +701,19 @@ class BoundarySnapshotSSDStore:
         acquired = self._writer_busy.acquire(
             timeout=self._CLEANUP_REQUEST_TIMEOUT_S
         )
+        if strict and not acquired:
+            raise TimeoutError("snapshot_cleanup_writer_unavailable")
         try:
             # Remove files.
             req_dir = self._request_dir(request_id)
+            if strict and not self._is_safe_snapshot_path(req_dir):
+                raise RuntimeError("snapshot_cleanup_path_unavailable")
             if self._is_safe_snapshot_path(req_dir) and req_dir.exists():
                 try:
                     shutil.rmtree(req_dir)
                 except Exception as e:
+                    if strict:
+                        raise
                     logger.debug(
                         "Failed to clean up snapshots for %s: %s", request_id, e
                     )
