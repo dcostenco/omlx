@@ -20,6 +20,8 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 
+from omlx.host_submit import submit_tracked
+
 SOURCE = (
     Path(__file__).resolve().parents[1]
     / "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/language.py"
@@ -66,6 +68,8 @@ def load_runtime():
         time=time,
         wait=wait,
         register_ple_resource=lambda *a, **k: None,
+        # Host-only, like the reader itself: counts failed submissions.
+        submit_tracked=submit_tracked,
         logger=logging.getLogger(__name__),
         mx=NoMLX(),
         nn=types.SimpleNamespace(Module=object),

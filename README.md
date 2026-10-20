@@ -1,3 +1,5 @@
+> **This is a fork for Prism.** It adds the control routes Prism's opt-in oMLX backend needs; see [PRISM.md](PRISM.md). Upstream: [jundot/omlx](https://github.com/jundot/omlx).
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/icon-rounded-dark.svg" width="140">
