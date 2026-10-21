@@ -60,6 +60,21 @@ Then, for Prism:
    during loading. The soft watermark controls idle eviction; the hard
    ceiling and Prism's resource probes still apply.
 
+## Side-by-side managed servers
+
+Set `OMLX_CLUSTER_SHIM_DIRECTORY` to an absolute private directory when starting
+a secondary server. Its `omlx-cluster-python` launcher is written there instead
+of replacing `~/.omlx/bin/omlx-cluster-python`. The default path is unchanged
+when the variable is unset. SSH discovery of the secondary server requires its
+explicit launcher path; the default SSH probe continues to select the primary
+installation. Relative directories are refused without falling back to the
+shared path.
+
+To restrict discovery to the secondary server's configured model directories,
+set `"huggingface": {"hf_cache_enabled": false}` in its settings. A private
+`HF_HUB_CACHE` also keeps its runtime Hub operations separate from the primary
+installation's cache.
+
 ## Known issue (upstream)
 
 After a request is requeued for memory and its resumed prefill fails and is

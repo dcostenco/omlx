@@ -35,6 +35,7 @@ CLUSTER_PYTHON_SHIM = "~/.omlx/bin/omlx-cluster-python"
 _SHIM_DIRECTORY = (".omlx", "bin")
 _SHIM_NAME = "omlx-cluster-python"
 _SHIM_MODE = 0o755
+_SHIM_DIRECTORY_ENV = "OMLX_CLUSTER_SHIM_DIRECTORY"
 
 # What the packaged launcher sets before the bundled interpreter can import
 # omlx. Anything unset here is deliberately not mentioned in the shim: an
@@ -44,6 +45,8 @@ _INHERITED_VARIABLES = (
     "PYTHONPATH",
     "PYTHONDONTWRITEBYTECODE",
     "OMLX_BASE_PATH",
+    _SHIM_DIRECTORY_ENV,
+    "HF_HUB_CACHE",
 )
 
 
@@ -84,8 +87,16 @@ def ensure_cluster_python_shim(
         logger.debug("Not publishing a cluster shim for %r: not absolute", executable)
         return None
 
-    directory = (home or Path.home()).joinpath(*_SHIM_DIRECTORY)
+    # Side-by-side servers can publish their interpreter without replacing
+    # the default installation's SSH discovery target. Never fall back to the
+    # shared path when an explicitly configured directory is invalid.
+    override = (environ.get(_SHIM_DIRECTORY_ENV) or "").strip()
+    if override and not Path(override).is_absolute():
+        logger.warning("Not publishing a cluster shim: %s must be absolute", _SHIM_DIRECTORY_ENV)
+        return None
+    directory = Path(override) if override else (home or Path.home()).joinpath(*_SHIM_DIRECTORY)
     target = directory / _SHIM_NAME
+    display_target = str(target) if override else CLUSTER_PYTHON_SHIM
     script = _render(executable, environ)
     temporary = directory / f".{_SHIM_NAME}.new"
     try:
@@ -104,7 +115,7 @@ def ensure_cluster_python_shim(
         os.replace(temporary, target)
     except OSError as exc:
         logger.warning(
-            "Could not publish %s for %s: %r", CLUSTER_PYTHON_SHIM, executable, exc
+            "Could not publish %s for %s: %r", display_target, executable, exc
         )
         try:
             temporary.unlink(missing_ok=True)
@@ -113,5 +124,5 @@ def ensure_cluster_python_shim(
                 "Could not remove the partial shim at %s: %r", temporary, cleanup_exc
             )
         return None
-    logger.info("Published %s -> %s", CLUSTER_PYTHON_SHIM, executable)
+    logger.info("Published %s -> %s", display_target, executable)
     return target

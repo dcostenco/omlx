@@ -102,6 +102,30 @@ def test_shim_omits_unset_interpreter_variables(tmp_path):
     assert script.rstrip().endswith('exec /usr/local/bin/python3.11 "$@"')
 
 
+def test_private_directory_preserves_the_existing_installation(tmp_path):
+    original = ensure_cluster_python_shim(home=tmp_path, executable=sys.executable, environ={})
+    before = original.read_bytes()
+    stamp = original.stat().st_mtime_ns
+    private = tmp_path / "managed server" / "bin"
+    written = ensure_cluster_python_shim(home=tmp_path, executable=sys.executable,
+        environ={"OMLX_CLUSTER_SHIM_DIRECTORY": str(private), "HF_HUB_CACHE": str(tmp_path / "managed cache")})
+    assert written == private / "omlx-cluster-python"
+    assert original.read_bytes() == before
+    assert original.stat().st_mtime_ns == stamp
+    completed = subprocess.run([str(written), "-c",
+        "import os; print(os.environ['OMLX_CLUSTER_SHIM_DIRECTORY']); print(os.environ['HF_HUB_CACHE'])"],
+        capture_output=True, text=True, check=True)
+    assert completed.stdout.splitlines() == [str(private), str(tmp_path / "managed cache")]
+
+
+def test_relative_private_directory_does_not_fall_back_to_shared_path(tmp_path, caplog):
+    with caplog.at_level(logging.WARNING):
+        assert ensure_cluster_python_shim(home=tmp_path,
+            environ={"OMLX_CLUSTER_SHIM_DIRECTORY": "relative/bin"}) is None
+    assert not (tmp_path / ".omlx").exists()
+    assert "must be absolute" in caplog.text
+
+
 def test_rewrite_is_atomic_and_skipped_when_unchanged(tmp_path):
     """A live SSH probe may be executing the shim; never truncate it in place."""
 
