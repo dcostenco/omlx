@@ -3930,6 +3930,17 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
     return status
 
 
+@app.post("/v1/models/{model_id:path}/unload-idle")
+async def unload_model_if_idle(model_id: str, _: bool = Depends(verify_api_key)):
+    """Unload a model only when it is idle; never abort active work."""
+    pool = _server_state.engine_pool
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+    if not await pool.unload_if_idle_unpinned(model_id):
+        raise HTTPException(status_code=409, detail=f"Model is not idle: {model_id}")
+    return {"status": "ok", "model_id": model_id}
+
+
 @app.post("/v1/models/{model_id}/unload")
 async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
     """Manually unload a model from memory."""

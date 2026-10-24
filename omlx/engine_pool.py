@@ -3151,7 +3151,7 @@ class EnginePool:
         await asyncio.shield(task)
 
     async def unload_if_idle_unpinned(self, model_id: str) -> bool:
-        """Unload a loaded engine only when it is idle and not pinned."""
+        """Unload only an unambiguously idle engine, without aborting work."""
         async with self._lock:
             entry = self._entries.get(model_id)
             if (
@@ -3160,14 +3160,50 @@ class EnginePool:
                 or entry.is_loading
                 or entry.is_pinned
                 or entry.in_use > 0
+                or model_id in self._unloading_models
+                or bool(getattr(entry, "pending_unload_reason", None))
+                or bool(getattr(entry, "abort_requested", False))
             ):
                 return False
 
-            if self._entry_has_active_requests(entry):
-                entry.last_access = time.time()
+            engine = entry.engine
+            try:
+                if getattr(engine, "runtime_failed_reason", None):
+                    return False
+                has_active_requests = getattr(engine, "has_active_requests", None)
+            except Exception:
                 return False
+            if not callable(has_active_requests):
+                return False
+            try:
+                if has_active_requests() is not False:
+                    return False
+            except Exception:
+                return False
+            rank_side = getattr(type(engine), "rank_side_active_requests", None)
+            if callable(rank_side):
+                try:
+                    if rank_side(engine) not in (0, False):
+                        return False
+                except Exception:
+                    return False
 
-            await self._unload_engine(model_id)
+            try:
+                scheduler = self._resolve_scheduler_from_engine(engine)
+            except Exception:
+                return False
+            if scheduler is not None:
+                try:
+                    has_requests = getattr(scheduler, "has_requests", None)
+                    if callable(has_requests) and has_requests() is not False:
+                        return False
+                    for attr in ("running", "waiting", "prefilling", "requests"):
+                        if getattr(scheduler, attr, None):
+                            return False
+                except Exception:
+                    return False
+
+            await self._unload_engine(model_id, require_stop_success=True)
             return True
 
     @asynccontextmanager
@@ -3723,13 +3759,21 @@ class EnginePool:
                 return True
         return False
 
-    async def _unload_engine(self, model_id: str, *, local_only: bool = False) -> None:
+    async def _unload_engine(
+        self,
+        model_id: str,
+        *,
+        local_only: bool = False,
+        require_stop_success: bool = False,
+    ) -> None:
         if model_id in self._unloading_models:
             raise ModelBusyError(model_id, "unload while teardown is in progress")
         self._unloading_models.add(model_id)
         task = asyncio.create_task(
             self._stop_and_unload_engine(
-                model_id, **({"local_only": True} if local_only else {})
+                model_id,
+                **({"local_only": True} if local_only else {}),
+                **({"require_stop_success": True} if require_stop_success else {}),
             )
         )
         cancelled = False
@@ -3768,7 +3812,11 @@ class EnginePool:
             await loop.run_in_executor(get_mlx_executor(), sync_clear)
 
     async def _stop_and_unload_engine(
-        self, model_id: str, *, local_only: bool = False
+        self,
+        model_id: str,
+        *,
+        local_only: bool = False,
+        require_stop_success: bool = False,
     ) -> None:
         """
         Immediately stop and unload an engine with memory settle barrier.
@@ -3802,14 +3850,14 @@ class EnginePool:
                 **({"local_only": True} if local_only and distributed else {})
             )
         except Exception as e:
-            if distributed:
+            if distributed or require_stop_success:
                 # The supervisor raises (DistributedTeardownError) when the
                 # final SIGKILL cannot be verified, so this path is now
                 # reachable: keep the supervisor reachable and the planned
                 # memory accounted so a later unload can retry process
                 # teardown instead of releasing the budget over a live rank.
                 logger.error(
-                    f"Distributed teardown failed for {model_id} ({e}); "
+                    f"Engine teardown failed for {model_id} ({e}); "
                     "keeping the engine registered for retry",
                     exc_info=True,
                 )
