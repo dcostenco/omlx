@@ -1101,7 +1101,8 @@ def test_unload_if_idle_unpinned_skips_pinned_and_unloads_idle(monkeypatch):
 
     unloaded = []
 
-    async def fake_unload(model_id):
+    async def fake_unload(model_id, *, require_stop_success=False):
+        assert require_stop_success is True
         unloaded.append(model_id)
 
     monkeypatch.setattr(pool, "_unload_engine", fake_unload)
