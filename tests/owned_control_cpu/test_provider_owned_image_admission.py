@@ -298,6 +298,18 @@ class ImageAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.s.model._vlm_model.config.model_type = "synthetic-unqualified"
         await self.assert_refused_before_preparation()
 
+    async def test_noncanonical_architecture_never_reaches_preparation(self):
+        self.s.model._vlm_model.config.model_type = "Qwen3-5"
+        await self.assert_refused_before_preparation()
+
+    async def test_gemma_architecture_never_reaches_preparation(self):
+        self.s.model._vlm_model.config.model_type = "gemma4"
+        await self.assert_refused_before_preparation()
+
+    async def test_qwen_vl_architecture_never_reaches_preparation(self):
+        self.s.model._vlm_model.config.model_type = "qwen3_vl"
+        await self.assert_refused_before_preparation()
+
     async def test_foreign_collector_never_reaches_preparation(self):
         self.core._output_collectors["foreign"] = object()
         try:

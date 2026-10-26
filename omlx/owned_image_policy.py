@@ -14,6 +14,15 @@ from .owned_images import (
 )
 
 OWNED_IMAGE_SCHEMA = "owned-png-v1"
+OWNED_VISION_ARCHITECTURES = frozenset({"qwen3_5", "prism_hadamard_qwen35"})
+
+
+def owned_vision_architecture_qualified(model_type):
+    """One canonical-family check for cold discovery and live admission."""
+    return (
+        isinstance(model_type, str)
+        and model_type in OWNED_VISION_ARCHITECTURES
+    )
 
 
 def image_input_capability(model_id, *, enabled, context_tokens):

@@ -58,6 +58,7 @@ from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from .decode_activity import get_decode_activity
 from .owned_admission import OwnedAdmission, RunningCleaned, WaitingCleaned
+from .owned_image_policy import owned_vision_architecture_qualified
 from .exceptions import (
     PrefillMemoryExceededError,
     describe_ceiling_binding,
@@ -11971,9 +11972,8 @@ class Scheduler:
         Other architectures need their own qualification before sharing this
         global clear. Model IDs and versions are deliberately not selected here.
         """
-        qualified_types = {"qwen3_5", "prism_hadamard_qwen35"}
         model = self.model
-        if model.model_type not in qualified_types:
+        if not owned_vision_architecture_qualified(model.model_type):
             return "vision_architecture_unqualified"
         for name in ("unregister_rope_delta", "clear_vlm_position_state", "clear_pending_embeddings"):
             if not callable(getattr(model, name, None)):

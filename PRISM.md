@@ -30,6 +30,10 @@ and current server configuration support the `owned-png-v1` input contract.
 A model's name or vision tag alone does not establish support. The server
 captures the applicable settings and refuses changed settings, unsupported
 configuration or concurrent model work. Request fields cannot enable support.
+To keep multiple operations bound to that capability snapshot, clients send its
+digest as top-level `expected_settings_sha256` on both registration and execution.
+A mismatch returns HTTP 409 with `X-Prism-Control-Error: settings_changed`
+before registration or execution claim; the field cannot grant capability.
 
 Supported input consists of inline PNG images in user messages. Remote URLs,
 filesystem paths, tool-output images, other formats and malformed images are

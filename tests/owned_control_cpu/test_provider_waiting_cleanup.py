@@ -16,6 +16,7 @@ from unittest.mock import Mock
 
 import test_provider_stream_barrier as stream_fixture
 from omlx.owned_admission import OwnedAdmission, RunningCleaned, WaitingCleaned
+from omlx.owned_image_policy import owned_vision_architecture_qualified
 from omlx.request import Request, RequestStatus, RequestOutput
 
 ROOT = stream_fixture.admission_fixture.ROOT
@@ -73,6 +74,7 @@ namespace = dict(
     OwnedAdmission=OwnedAdmission,
     WaitingCleaned=WaitingCleaned,
     RunningCleaned=RunningCleaned,
+    owned_vision_architecture_qualified=owned_vision_architecture_qualified,
     deque=deque,
     time=time,
     logger=logging.getLogger("waiting-proof"),
