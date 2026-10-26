@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from PIL import Image, ImageOps
 
 from ..exceptions import InvalidRequestError
+from ..owned_image_cache import image_cache_allowed
 from ..settings import get_settings
 from .video import _video_url
 
@@ -206,6 +207,8 @@ def clear_image_decode_cache() -> int:
 
 
 def _cached_image(key: str) -> Image.Image | None:
+    if not image_cache_allowed():
+        return None
     with _image_decode_cache_lock:
         hit = _image_decode_cache.get(key)
         if hit is not None:
@@ -281,13 +284,15 @@ def _load_image_bytes(
             field=field,
         )
 
+    use_cache = image_cache_allowed()
     key = hashlib.sha256(img_bytes).hexdigest()
-    with _image_decode_cache_lock:
-        if generation is None:
-            generation = _image_decode_cache_generation
-    hit = _cached_image(key)
-    if hit is not None:
-        return hit
+    if use_cache:
+        with _image_decode_cache_lock:
+            if generation is None:
+                generation = _image_decode_cache_generation
+        hit = _cached_image(key)
+        if hit is not None:
+            return hit
 
     try:
         rgb = _decode_downscaled(Image.open(io.BytesIO(img_bytes)))
@@ -303,7 +308,7 @@ def _load_image_bytes(
         ) from exc
 
     nbytes = _decoded_pixel_bytes(rgb)
-    if nbytes <= _IMAGE_DECODE_CACHE_MAX_BYTES:
+    if use_cache and nbytes <= _IMAGE_DECODE_CACHE_MAX_BYTES:
         global _image_decode_cache_bytes
         with _image_decode_cache_lock:
             if generation != _image_decode_cache_generation:

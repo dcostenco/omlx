@@ -58,6 +58,7 @@ from .cache.pooling_delta import compact_pooling_cache_snapshot
 from .cache.prefix_cache import BlockAwarePrefixCache, cachelist_pm_member_plan
 from .decode_activity import get_decode_activity
 from .owned_admission import OwnedAdmission, RunningCleaned, WaitingCleaned
+from .owned_image_policy import owned_vision_architecture_qualified
 from .exceptions import (
     PrefillMemoryExceededError,
     describe_ceiling_binding,
@@ -4434,7 +4435,9 @@ class Scheduler:
             if start_offset > 0:
                 lm = getattr(self.model, "_language_model", None)
                 if lm is not None and hasattr(lm, "_rope_deltas"):
-                    _saved_rope_deltas = lm._rope_deltas
+                    # A previous None is still a saved binding. Keep its
+                    # owner too: a later model lookup may select another LM.
+                    _saved_rope_deltas = (lm, lm._rope_deltas)
                     lm._rope_deltas = None
             # Stash so the #1405 requeue path can restore it if this prefill
             # raises before the normal restore below runs.
@@ -4554,6 +4557,12 @@ class Scheduler:
                     **({"minimum_tokens": atomic_prefix} if atomic_prefix else {}),
                 )
             except _PrefillEvictionNeeded:
+                # A pause yields the model to other work. Restore before the
+                # resumed attempt can overwrite this request's snapshot.
+                if vlm_embeds is not None and _saved_rope_deltas is not None:
+                    lm, previous_delta = _saved_rope_deltas
+                    lm._rope_deltas = previous_delta
+                request._prefill_saved_rope_deltas = None
                 # Keep token progress aligned with the advanced KV on retry.
                 # Cold requests must also retain their locally created cache.
                 if processed_tokens > 0:
@@ -4729,7 +4738,8 @@ class Scheduler:
                     f"{len(abort_uids)} request(s) aborted"
                 )
                 if vlm_embeds is not None and _saved_rope_deltas is not None:
-                    self.model._language_model._rope_deltas = _saved_rope_deltas
+                    lm, previous_delta = _saved_rope_deltas
+                    lm._rope_deltas = previous_delta
                 request._prefill_saved_rope_deltas = None
                 # A client cancel keeps this progress; the cache is only
                 # reachable here, so extract it before the references drop.
@@ -4809,7 +4819,8 @@ class Scheduler:
 
         # Restore _rope_deltas after cached VLM prefill (for decode capture)
         if vlm_embeds is not None and _saved_rope_deltas is not None:
-            self.model._language_model._rope_deltas = _saved_rope_deltas
+            lm, previous_delta = _saved_rope_deltas
+            lm._rope_deltas = previous_delta
         request._prefill_saved_rope_deltas = None
 
         # Quantize the completed fp16 KV cache to TurboQuant for decode.
@@ -11933,7 +11944,8 @@ class Scheduler:
         """Entangled or unsafe running states, refused before any mutation."""
         with owned._lock:
             text_only = owned._text_only
-        if not text_only or getattr(request, "rope_deltas", 0) != 0:
+            prepared_vision = owned._prepared_vision
+        if not prepared_vision and (not text_only or getattr(request, "rope_deltas", 0) != 0):
             return "not_text_only"
         if self._step_failed:
             return "scheduler_dirty"
@@ -11948,6 +11960,92 @@ class Scheduler:
             return "specprefill"
         if not self._owned_admission_complete(owned, request):
             return "admission_incomplete"
+        if prepared_vision:
+            return self._owned_vision_refusal(request, rid)
+        return None
+
+    def _owned_vision_refusal(self, request, rid, *, retired=False, cleared=False):
+        """Single-row prepared Qwen cleanup only; unknown adapter state refuses.
+
+        Qwen preparation captures positions/deltas in each request's kwargs.
+        A prepared request not inserted yet does not depend on these globals.
+        Other architectures need their own qualification before sharing this
+        global clear. Model IDs and versions are deliberately not selected here.
+        """
+        model = self.model
+        if not owned_vision_architecture_qualified(model.model_type):
+            return "vision_architecture_unqualified"
+        for name in ("unregister_rope_delta", "clear_vlm_position_state", "clear_pending_embeddings"):
+            if not callable(getattr(model, name, None)):
+                return "vision_adapter_unavailable"
+        if (
+            model._pending_embeds is not None
+            or type(model._pending_kwargs) is not dict or len(model._pending_kwargs) != 0
+            or type(model._embed_offset) is not int or model._embed_offset != 0
+        ):
+            return "vision_pending_state"
+        lm = model._language_model
+        saved = getattr(request, "_prefill_saved_rope_deltas", None)
+        if saved is not None and (type(saved) is not tuple or len(saved) != 2 or saved[0] is not lm):
+            return "vision_snapshot_owner"
+        state = None if retired else self._owned_running_state(request, rid)
+        if not retired and state is None:
+            return "unsupported_state"
+        uid = None if retired else self.request_id_to_uid.get(rid)
+        expected_uids = set() if uid is None else {uid}
+        if any(type(u) is not int or u < 0 for u in expected_uids):
+            return "vision_uid_inventory"
+        if (
+            type(model._uid_rope_deltas) is not dict
+            or not set(model._uid_rope_deltas) <= expected_uids
+            or type(model._uid_text_positions) is not set
+            or not model._uid_text_positions <= expected_uids
+            or any(type(u) is not int for u in (*model._uid_rope_deltas, *model._uid_text_positions))
+        ):
+            return "vision_foreign_adapter_uid"
+        if retired:
+            maps_valid = not (self.requests or self.running or self.prefilling or self._prefill_states
+                              or self.request_id_to_uid or self.uid_to_request_id)
+        else:
+            maps_valid = (
+                set(self.requests) == {rid} and self.requests[rid] is request
+                and set(self.running) == ({rid} if state == "decoding" else set())
+                and (state != "decoding" or self.running[rid] is request)
+                and len(self.prefilling) == (1 if state == "chunked_prefill" else 0)
+                and all(r is request for r in self.prefilling)
+                and set(self._prefill_states) == ({rid} if state == "chunked_prefill" else set())
+                and self.request_id_to_uid == ({rid: uid} if uid is not None else {})
+                and self.uid_to_request_id == ({uid: rid} if uid is not None else {})
+            )
+        if (
+            not maps_valid or self.waiting or self._inflight_store_futures
+            or self._pending_async_removes or self._pending_abort_ids
+            or self._prefill_eviction_awaiting or self._specprefill_active_request_id is not None
+        ):
+            return "vision_foreign_request"
+        rows = []
+        generator = self.batch_generator
+        if generator is not None:
+            for batch in (generator._generation_batch, generator._prompt_batch):
+                if type(batch.uids) is not list:
+                    return "vision_generator_inventory"
+                rows.extend(batch.uids)
+            for entry in generator._unprocessed_sequences:
+                if type(entry) is not tuple or not entry:
+                    return "vision_generator_inventory"
+                rows.append(entry[0])
+        if (
+            any(type(u) is not int or u < 0 for u in rows)
+            or len(rows) != len(expected_uids) or set(rows) != expected_uids
+        ):
+            return "vision_generator_inventory"
+        if cleared and (
+            lm._position_ids is not None or lm._rope_deltas is not None
+            or model._batch_rope_deltas is not None
+            or model._qwen4_text_prefill_positions is not False
+            or model._qwen4_step_text_positions is not False
+        ):
+            return "vision_clear_incomplete"
         return None
 
     def _owned_model_refusal(self):
@@ -11967,6 +12065,15 @@ class Scheduler:
             return "vlm_mtp"
         if getattr(self, "_specprefill_draft_model", None) is not None:
             return "specprefill"
+        try:
+            pending_embeddings = getattr(model, "has_pending_embeddings")
+        except AttributeError:
+            missing = object()
+            if inspect.getattr_static(model, "has_pending_embeddings", missing) is not missing:
+                raise
+            pending_embeddings = False
+        if pending_embeddings:
+            return "pending_embeddings"
         return None
 
     def _owned_running_state(self, request, rid):
@@ -12089,6 +12196,8 @@ class Scheduler:
         return "present"
 
     def _cleanup_owned_running(self, owned, request, rid, state):
+        with owned._lock:
+            prepared_vision = owned._prepared_vision
         existing = self._owned_waiting_cleanup_proofs.get(rid)
         if existing is not None:
             if existing.handle is owned and existing.state == "cleaned":
@@ -12106,11 +12215,24 @@ class Scheduler:
             owned.validate(owned.binding.core, rid)
             if time.monotonic() >= owned._stream_effective_deadline:
                 raise TimeoutError("owned_cleanup_expired")
-            if self._boundary_snapshot_store is not None:
+            if not prepared_vision and self._boundary_snapshot_store is not None:
                 self._boundary_snapshot_store.cleanup_request(rid, strict=True)
-            if self._stream is None:
+            owned.validate(owned.binding.core, rid)
+            if self._stream is not owned.binding.stream:
+                raise RuntimeError("owned_cleanup_stream_mismatch")
+            if owned.binding.stream is None:
                 raise RuntimeError("owned_cleanup_stream_unavailable")
-            mx.synchronize(self._stream)
+            mx.synchronize(owned.binding.stream)
+            owned.validate(owned.binding.core, rid)
+            if self._stream is not owned.binding.stream:
+                raise RuntimeError("owned_cleanup_stream_mismatch")
+            if time.monotonic() >= owned._stream_effective_deadline:
+                raise TimeoutError("owned_cleanup_expired")
+            if prepared_vision and (
+                self._owned_running_refusal(owned, request, rid) is not None
+                or self._owned_running_state(request, rid) != state
+            ):
+                raise RuntimeError("owned_vision_cleanup_state_changed")
         except Exception:
             proof.state = owned._cleanup_outcome = "failed"
             return None
@@ -12212,12 +12334,42 @@ class Scheduler:
         if drop_generator:
             guarded("generator_drop", drop_shared_generator)
         guarded("deferred_metal_clear", self._schedule_deferred_metal_clear)
+        if prepared_vision and not failures:
+            # The target cannot forward after a partial global clear: retire
+            # its rows first, then drain retirement work before dropping refs.
+            try:
+                if self._owned_vision_refusal(request, rid, retired=True) is not None:
+                    raise RuntimeError("owned_vision_retirement_incomplete")
+                mx.synchronize(owned.binding.stream)
+                owned.validate(owned.binding.core, rid)
+                if self._stream is not owned.binding.stream:
+                    raise RuntimeError("owned_cleanup_stream_mismatch")
+                if time.monotonic() >= owned._stream_effective_deadline:
+                    raise TimeoutError("owned_cleanup_expired")
+                if self._owned_vision_refusal(request, rid, retired=True) is not None:
+                    raise RuntimeError("owned_vision_retirement_changed")
+                if self._boundary_snapshot_store is not None:
+                    self._boundary_snapshot_store.cleanup_request(rid, strict=True)
+                self.model.clear_vlm_position_state()
+                self.model.clear_pending_embeddings()
+                if self._owned_vision_refusal(request, rid, retired=True, cleared=True) is not None:
+                    raise RuntimeError("owned_vision_clear_incomplete")
+                request._prefill_saved_rope_deltas = None
+            except Exception:
+                failures.append("vision_retirement_failed")
         # Step 7.
         if failures:
             with owned._lock:
                 owned._cleanup_failures = tuple(failures)
             proof.state = owned._cleanup_outcome = "failed"
             return None
+        # Only successful retirement may detach this request's prepared media.
+        # Failed cleanup retains those references with its unresolved owner.
+        request.vlm_inputs_embeds = None
+        request.vlm_extra_kwargs = None
+        request.vlm_image_hash = None
+        request.vlm_cache_key_start = 0
+        request.vlm_cache_key_ranges = None
         proof.fact = RunningCleaned(owned, request, proof.generation_id, rid, state)
         proof.state = owned._cleanup_outcome = "cleaned"
         return proof.fact
@@ -12251,6 +12403,13 @@ class Scheduler:
         proof = _WaitingCleanupProof(owned, request, owned.binding.generation_id)
         self._owned_waiting_cleanup_proofs[rid] = proof
         try:
+            with owned._lock:
+                text_only = owned._text_only
+                prepared_vision = (
+                    owned._preparation_started and owned._preparation_synchronized
+                    and not text_only and not owned._started
+                    and request.vlm_inputs_embeds is not None
+                )
             active_maps = [self.running, self._prefill_states, self.request_id_to_uid,
                 self._inflight_store_futures, self._boundary_cache_snapshots,
                 self._request_detokenizers, self._output_parser_sessions, self._prefix_cache_prepared]
@@ -12268,8 +12427,11 @@ class Scheduler:
                 or request.prefill_resumed_tokens != 0 or bool(request.output_token_ids)
                 or request.batch_uid is not None or request.prompt_cache is not None
                 or request.block_table is not None or getattr(request, "_extracted_cache", None) is not None
-                or bool(request.images) or bool(request.videos) or request.vlm_inputs_embeds is not None
-                or request.vlm_extra_kwargs is not None
+                or bool(request.images) or bool(request.videos)
+                or (not text_only and not prepared_vision)
+                or (prepared_vision and request.rope_deltas != 0)
+                or (not prepared_vision and (request.vlm_inputs_embeds is not None
+                    or request.vlm_extra_kwargs is not None))
                 or self._pending_prefill_eviction_request is not None
                 or (self.paged_cache_manager is not None and self.paged_cache_manager.get_block_table(rid) is not None)
             )
@@ -12281,7 +12443,13 @@ class Scheduler:
                 raise TimeoutError("owned_cleanup_expired")
             if self._boundary_snapshot_store is not None:
                 self._boundary_snapshot_store.cleanup_request(rid, strict=True)
+            if prepared_vision:
+                # Prepared on this owned stream, still waiting before compute.
+                # Do not detach payloads until the strict barrier settles.
+                mx.synchronize(owned.binding.stream)
             owned.validate(owned.binding.core, rid)
+            if prepared_vision and self._stream is not owned.binding.stream:
+                raise ValueError("owned_cleanup_stream_changed")
             if time.monotonic() >= owned._stream_effective_deadline:
                 raise TimeoutError("owned_cleanup_expired")
             self._cache_freshness_waits.pop(rid, None)
@@ -12294,6 +12462,12 @@ class Scheduler:
             if self.requests.get(rid) is not request:
                 raise ValueError("owned_cleanup_request_changed")
             del self.requests[rid]
+            if prepared_vision:
+                request.vlm_inputs_embeds = None
+                request.vlm_extra_kwargs = None
+                request.vlm_image_hash = None
+                request.vlm_cache_key_start = 0
+                request.vlm_cache_key_ranges = None
             proof.fact = WaitingCleaned(owned, request, proof.generation_id, rid)
             proof.state = owned._cleanup_outcome = "cleaned"
             return proof.fact
@@ -15410,9 +15584,8 @@ class Scheduler:
         # _do_external_prefill). Benign for non-VLM requests (stash is None).
         saved = getattr(request, "_prefill_saved_rope_deltas", None)
         if saved is not None:
-            lm = getattr(self.model, "_language_model", None)
-            if lm is not None and hasattr(lm, "_rope_deltas"):
-                lm._rope_deltas = saved
+            lm, previous_delta = saved
+            lm._rope_deltas = previous_delta
             request._prefill_saved_rope_deltas = None
 
         # Reset scheduling + cache + output state to a clean pre-prefill state

@@ -269,7 +269,7 @@ class RegistrationTests(unittest.TestCase):
 
         def inventory(model):
             seen.append(model)
-            return object() if model == REQUEST["model"] else None
+            return SimpleNamespace(engine_type="batched", model_type="llm") if model == REQUEST["model"] else None
 
         state = SimpleNamespace(
             engine_pool=SimpleNamespace(get_entry=inventory),
@@ -277,7 +277,9 @@ class RegistrationTests(unittest.TestCase):
             sampling=Config(12),
         )
         scope = {
+            "__name__": "omlx.server",
             "_server_state": state,
+            "_configured_max_context_window": lambda model: 8192,
             "asdict": asdict,
             "HTTPException": support.auth.HTTPException,
             "get_model_settings_for_request": lambda model: SimpleNamespace(
@@ -299,6 +301,53 @@ class RegistrationTests(unittest.TestCase):
         self.assertNotIn("must-not-enter-snapshot", json.dumps(snapshot))
         with self.assertRaises(support.auth.HTTPException):
             scope["get_control_settings_snapshot"]("unknown-model")
+
+    def test_snapshot_never_advertises_an_unqualified_vision_architecture(self):
+        tree = ast.parse((support.ROOT / "omlx/server.py").read_text())
+        nodes = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "get_control_settings_snapshot"
+            or isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "CONTROL_SETTINGS_SECTIONS"
+                    for target in node.targets)
+        ]
+
+        @dataclass
+        class Section:
+            enabled: bool = False
+
+        entry = SimpleNamespace(engine_type="vlm", model_type="vlm",
+                                config_model_type="qwen3_5")
+        pool = SimpleNamespace(
+            get_entry=lambda _: entry,
+            _distributed_deployment_for_entry=lambda _: None,
+            _entry_is_diffusion_model=lambda _: False,
+        )
+        names = ("server", "memory", "cache", "scheduler", "sampling", "idle_timeout")
+        scope = {
+            "__name__": "omlx.server", "asdict": asdict,
+            "_server_state": SimpleNamespace(
+                engine_pool=pool,
+                global_settings=SimpleNamespace(**{name: Section() for name in names}),
+                sampling=Section()),
+            "HTTPException": support.auth.HTTPException,
+            "_configured_max_context_window": lambda _: 8192,
+            "get_model_settings_for_request": lambda _: SimpleNamespace(to_dict=lambda: {}),
+            "owned_entry_refusal": lambda *args, **kwargs: None,
+        }
+        exec(compile(ast.Module(body=nodes, type_ignores=[]),
+                     str(support.ROOT / "omlx/server.py"), "exec"), scope)
+        snapshot = scope["get_control_settings_snapshot"]
+        for family, expected in [
+            ("qwen3_5", True), ("Qwen3-5", False),
+            ("prism_hadamard_qwen35", True), ("gemma4", False),
+            ("qwen3_vl", False), (None, False), ("", False),
+        ]:
+            with self.subTest(family=family):
+                entry.config_model_type = family
+                self.assertIs(snapshot("synthetic-model")["owned_image_input"]["enabled"], expected)
 
 
 if __name__ == "__main__":

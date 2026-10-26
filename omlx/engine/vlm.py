@@ -47,7 +47,9 @@ from ..api.utils import (
 )
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
+from ..owned_image_cache import image_cache_allowed
 from ..model_settings import ane_prefill_backend, ane_prefill_fraction
+from ..owned_vision_preparation import prepare_owned_vision
 from ..models.vlm import VLMModelAdapter
 from ..patches import qwen35_packed_linear
 from ..patches.gemma4_audio import apply_gemma4_audio_patch
@@ -3585,6 +3587,8 @@ class VLMBatchedEngine(BaseEngine):
         Qwen-style towers attend within each image, so a subset encodes
         independently. Returns None when the request cannot be split safely.
         """
+        if not image_cache_allowed():
+            return None
         model = self._vlm_model
         model_type = self.model_type or ""
         grid_thw = extra_model_inputs.get("image_grid_thw")
@@ -3674,6 +3678,8 @@ class VLMBatchedEngine(BaseEngine):
         expands each marker from the cached or fresh patch grid. Adds
         ``cached_image_features``. Returns None to use the full path.
         """
+        if not image_cache_allowed():
+            return None
         model_type = self.model_type or ""
         if (
             model_type not in _CACHED_INPUT_FAST_PREPARE_MODEL_TYPES
@@ -3973,7 +3979,11 @@ class VLMBatchedEngine(BaseEngine):
         tower re-encodes every sampled frame on each turn, even when the prefix
         cache already covers the whole prompt.
         """
-        if self._vision_cache is None or not self._vision_cache_enabled:
+        if (
+            not image_cache_allowed()
+            or self._vision_cache is None
+            or not self._vision_cache_enabled
+        ):
             return None
         token_count = self._image_token_count(input_ids, "video_token_id")
         features = self._vision_cache.get(video_identity, self._model_name)
@@ -4445,6 +4455,7 @@ class VLMBatchedEngine(BaseEngine):
 
             if (
                 num_images > 0
+                and image_cache_allowed()
                 and self._vision_cache is not None
                 and self._vision_cache_enabled
                 # Fast path already assembled the combined features.
@@ -5364,7 +5375,7 @@ class VLMBatchedEngine(BaseEngine):
             request_id=request_id,
         )
 
-    async def _stream_chat_prompt(self, messages, tools, kwargs):
+    async def _stream_chat_prompt(self, messages, tools, kwargs, *, admission=None):
         """stream_chat's prompt and VLM inputs, as passed to stream_generate.
 
         Shared with owned admission. Runs _process_chat_messages on the MLX
@@ -5378,6 +5389,23 @@ class VLMBatchedEngine(BaseEngine):
         # _process_chat_messages pops these; the tail marker needs them too.
         ct_kwargs = kwargs.get("chat_template_kwargs")
         partial = kwargs.get("is_partial")
+        process = self._process_chat_messages
+        executor = self._engine._mlx_executor
+        if admission is not None:
+            if executor is not admission.binding.executor:
+                raise ValueError("owned_preparation_executor_changed")
+            process = functools.partial(
+                prepare_owned_vision,
+                admission,
+                self._engine.engine,
+                process,
+                dispatch_executor=executor,
+                stream_context=mx.stream,
+                synchronize=mx.synchronize,
+                language_model=getattr(
+                    getattr(self, "_vlm_model", None), "language_model", None
+                ),
+            )
         (
             prompt,
             vlm_embeds,
@@ -5386,8 +5414,8 @@ class VLMBatchedEngine(BaseEngine):
             image_cache_key_start,
             image_cache_key_ranges,
         ) = await loop.run_in_executor(
-            self._engine._mlx_executor,
-            self._process_chat_messages,
+            executor,
+            process,
             messages,
             tools,
             kwargs,
@@ -5449,7 +5477,9 @@ class VLMBatchedEngine(BaseEngine):
         )
         if clash:
             raise TypeError(f"owned_admission_unexpected_arguments: {clash}")
-        prompt, vlm = await self._stream_chat_prompt(messages, tools, kwargs)
+        prompt, vlm = await self._stream_chat_prompt(
+            messages, tools, kwargs, admission=admission
+        )
         # stream_chat hands these to stream_generate as keywords.
         stop = kwargs.pop("stop", None)
         kwargs["tools"] = tools

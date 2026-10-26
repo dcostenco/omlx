@@ -179,7 +179,8 @@ async def asgi(app, method, url, payload=None, *, raw=None, key=KEY, disconnect=
     await app(scope, receive, send)
     start = next((m for m in sent if m["type"] == "http.response.start"), None)
     chunks = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
-    return Result(status=None if start is None else start["status"], body=chunks)
+    return Result(status=None if start is None else start["status"], body=chunks,
+                  headers={} if start is None else dict(start.get("headers", [])))
 
 
 def execute_body(request=REQUEST, timeout_ms=5000):
@@ -271,6 +272,74 @@ class ExecuteTests(unittest.TestCase):
             (type(after).__name__, after.state, after.evidence, after.claim_state),
             ("ControlTerminalStatus", "not_started", ("not_admitted",), "finished"),
         )
+
+    def test_expected_settings_digest_permits_matching_register_and_execute(self):
+        h = self.make()
+        expected = routes.canonical_digest(h.snapshot(REQUEST["model"]))
+
+        async def scenario():
+            registered = await asgi(h.app, "PUT", path(), {
+                "request": REQUEST, "expected_settings_sha256": expected})
+            self.assertEqual(registered.status, 200, registered.body)
+            return await asgi(h.app, "POST", path(suffix="/execute"), {
+                **execute_body(), "expected_settings_sha256": expected})
+
+        result = self.run_async(scenario())
+        self.assertEqual(result.status, 200, result.body)
+        self.assertEqual(h.store.calls.count("claim"), 1)
+        self.assertTrue(result.events()[-1][1]["backend_stopped"])
+
+    def test_stale_expected_digest_cannot_register_a_later_stage(self):
+        h = self.make()
+        expected = routes.canonical_digest(h.snapshot(REQUEST["model"]))
+
+        async def scenario():
+            await self.register(h)
+            first = await asgi(h.app, "POST", path(suffix="/execute"), execute_body())
+            self.assertEqual(first.status, 200)
+            h.snapshot.version = 2
+            stale = await asgi(h.app, "PUT", path(OP2), {
+                "request": REQUEST, "expected_settings_sha256": expected})
+            self.assertEqual(stale.status, 409, stale.body)
+            self.assertEqual(stale.headers[b"x-prism-control-error"], b"settings_changed")
+            self.assertEqual(stale.json()["error"]["code"], "settings_changed")
+            self.assertEqual(h.store.calls.count("register"), 1)
+            self.assertIsNone(self.status(h, OP2))
+            # A legacy caller without a request-wide expectation can still
+            # deliberately start independent work under the new settings.
+            return await self.register(h, OP2)
+
+        result = self.run_async(scenario())
+        self.assertEqual(result["settings_sha256"], routes.canonical_digest(h.snapshot(REQUEST["model"])))
+
+    def test_expected_digest_mismatch_refuses_before_execute_claim(self):
+        h = self.make()
+
+        async def scenario():
+            await self.register(h)
+            return await asgi(h.app, "POST", path(suffix="/execute"), {
+                **execute_body(), "expected_settings_sha256": "f" * 64})
+
+        result = self.run_async(scenario())
+        self.assertEqual(result.status, 409, result.body)
+        self.assertEqual(result.headers[b"x-prism-control-error"], b"settings_changed")
+        self.assertEqual(result.json()["error"]["code"], "settings_changed")
+        self.assertNotIn("claim", h.store.calls)
+        self.assertEqual(self.status(h).claim_state, "none")
+        self.assertEqual(h.coordinator._executions, {})
+
+    def test_malformed_expected_digests_are_invalid_without_registration(self):
+        h = self.make()
+
+        async def scenario():
+            for expected in [None, True, {}, [], "bad", "a" * 63, "A" * 64]:
+                result = await asgi(h.app, "PUT", path(), {
+                    "request": REQUEST, "expected_settings_sha256": expected})
+                self.assertEqual(result.status, 400, (expected, result.body))
+
+        self.run_async(scenario())
+        self.assertNotIn("register", h.store.calls)
+        self.assertNotIn("claim", h.store.calls)
 
     # 2. Refusals that write nothing.
     def test_body_digest_and_auth_refusals_write_nothing(self):

@@ -424,6 +424,7 @@ class EngineEntry:
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
     in_use: int = 0  # in-flight acquire/use lease count; never evict while > 0
+    owned_image_active: bool = False  # sole owned image lease; ordinary work refuses
     abort_requested: bool = False  # Set under hard pressure for leased requests
     pending_unload_reason: str | None = None  # Unload as soon as leases/activity drain
     pending_unload_allow_pinned: bool = False  # Explicit unload may override pinning
@@ -2532,6 +2533,8 @@ class EnginePool:
         on the pool's event loop. Loads and settings changes still take the lock.
         """
         entry = self._entries.get(model_id)
+        if entry is not None and getattr(entry, "owned_image_active", False):
+            raise ModelBusyError(model_id, "start work during owned image execution")
         if (
             entry is None
             or entry.engine is None
@@ -2636,6 +2639,8 @@ class EnginePool:
         entry = self._entries.get(model_id)
         if not entry:
             raise ModelNotFoundError(model_id, list(self._entries.keys()))
+        if getattr(entry, "owned_image_active", False):
+            raise ModelBusyError(model_id, "start work during owned image execution")
         if entry.pending_unload_reason:
             raise ModelBusyError(model_id, "start work while unload is pending")
         expected_signature = self._engine_runtime_signature(
@@ -2959,6 +2964,8 @@ class EnginePool:
     def _raise_owned_refusal(self, model_id: str) -> EngineEntry:
         """Pre-load refusals from the exact entry and its persisted settings."""
         entry = self._entries.get(model_id)
+        if entry is not None and getattr(entry, "owned_image_active", False):
+            raise OwnedPreparationRefused("image_busy")
         settings = None
         if entry is not None and self._settings_manager is not None:
             get_settings = getattr(self._settings_manager, "get_settings", None)
@@ -3106,6 +3113,28 @@ class EnginePool:
             raise
         return OwnedLease(model_id, engine)
 
+    async def acquire_owned_image(self, model_id: str, *, fence) -> OwnedLease:
+        """Reserve the sole lease before owned image preparation starts.
+
+        The final check and marker write have no await. An ordinary acquisition
+        during the preceding owned checks makes the image acquisition refuse;
+        after the marker is set, ordinary and other owned acquisitions refuse.
+        The existing release path clears it only when that sole lease drains.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None or entry.engine_type != "vlm" or entry.model_type != "vlm":
+            raise OwnedPreparationRefused("image_engine")
+        if entry.in_use or getattr(entry, "owned_image_active", False):
+            raise OwnedPreparationRefused("image_busy")
+        lease = await self.acquire_owned(model_id, fence=fence)
+        current = self._entries.get(model_id)
+        if (current is not entry or current.engine is not lease.engine
+                or current.in_use != 1 or getattr(current, "owned_image_active", False)):
+            await self.release_engine(model_id)
+            raise OwnedPreparationRefused("image_busy")
+        current.owned_image_active = True
+        return lease
+
     async def _release_engine_lease(self, model_id: str) -> None:
         # A normal completed request need not wait behind unrelated teardown.
         entry = self._entries.get(model_id)
@@ -3113,12 +3142,16 @@ class EnginePool:
             if entry.in_use > 0:
                 entry.in_use -= 1
                 entry.last_access = time.time()
+                if entry.in_use == 0:
+                    entry.owned_image_active = False
             return
         async with self._lock:
             e = self._entries.get(model_id)
             if e is not None and e.in_use > 0:
                 e.in_use -= 1
                 e.last_access = time.time()
+                if e.in_use == 0:
+                    e.owned_image_active = False
             await self._unload_pending_if_idle_locked(model_id)
 
     def _finish_lease_release_task(self, task: asyncio.Task[None]) -> None:

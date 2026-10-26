@@ -103,11 +103,12 @@ class Execution:
     """One live execution; touched only on the event-loop thread."""
 
     def __init__(self, coordinator, identity, request_sha256, model_id, settings_sha256, deadline,
-                 request=None):
+                 request=None, image_policy=None):
         self._coordinator = coordinator
         self.identity = identity
         # The parsed registered request; owned admission reads it (27.4b).
         self.request = request
+        self.image_policy = image_policy
         # Set on the loop thread once admission returned; the fence reads it.
         self.admitted = False
         self.request_sha256 = request_sha256
@@ -119,6 +120,7 @@ class Execution:
         self.stop_requested = False
         self.task = None
         self.final = False
+        self._final_event = None
         # Owned by the engine stage; released exactly once there.
         self.lease = None
         # Set when preparation refuses; bounds the reclaim wait and finish.
@@ -136,6 +138,7 @@ class Execution:
     def emit(self, event, payload=None):
         if event in FINAL_EVENTS:
             self.final = True
+            self._final_event = event
         self._events.put_nowait((event, payload))
 
     async def next_event(self):
@@ -182,7 +185,7 @@ class ControlCoordinator:
         return self._lock
 
     def start(self, identity, *, request_sha256, model_id, settings_sha256, deadline,
-              request=None):
+              request=None, image_policy=None):
         """Register and start one execution; no await, so no second can race."""
         if self._closed:
             raise CoordinatorClosed()
@@ -191,7 +194,7 @@ class ControlCoordinator:
         if live is not None and not live.task.done():
             raise ExecutionExists()
         execution = Execution(
-            self, identity, request_sha256, model_id, settings_sha256, deadline, request
+            self, identity, request_sha256, model_id, settings_sha256, deadline, request, image_policy
         )
         execution.task = asyncio.get_running_loop().create_task(self._run(execution))
         self._executions[identity] = execution
@@ -208,6 +211,16 @@ class ControlCoordinator:
                 execution.emit("refused", "unavailable")
             else:
                 execution.emit("unresolved")
+        if execution._final_event in ("refused", "terminal") and execution.lease is None:
+            # A slow SSE reader may still hold the settled Execution and task.
+            # Keep its queued events, but drop completed stage payloads. An
+            # unresolved execution or held lease must keep its ownership.
+            execution.request = None
+            execution.image_policy = None
+            execution.preparation_handle = None
+            execution._fence = None
+            execution.cleanup_task = None
+            execution.final_output = None
 
     def fence(self, identity):
         """Called by the cancel route after the tombstone commits, before it answers."""

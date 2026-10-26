@@ -5,11 +5,12 @@ from dataclasses import asdict
 from functools import partial
 from hashlib import sha256
 import asyncio
+import copy
 import json
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import ValidationError
 
@@ -27,6 +28,8 @@ from .prism_control_store import (
     ControlCapacity,
 )
 from .responses_models import ResponsesRequest
+from ..owned_images import validate_owned_images
+from ..owned_image_policy import capture_image_policy
 from .utils import find_lone_surrogate
 
 MAX_CREDENTIAL_BYTES = 4096
@@ -35,6 +38,9 @@ MAX_REGISTRATION_BYTES = 256 * 1024
 MAX_CONTROL_OUTPUT_TOKENS = 8192
 BODY_TIMEOUT_SECONDS = 3
 MAX_ADMISSION_TIMEOUT_MS = 120_000
+EXPECTED_SETTINGS_FIELD = "expected_settings_sha256"
+SETTINGS_DIGEST_LENGTH = 64
+SETTINGS_DIGEST_CHARACTERS = frozenset("0123456789abcdef")
 REFUSALS = {
     "conflict": (409, "Control execution refused"),
     "timeout": (408, "Control request timed out"),
@@ -56,6 +62,7 @@ def registration_payload(record):
         "engine_generation_verified": False,
         "provider_qualified": False,
         "production_enabled": False,
+        "qualification_scope": "registration_only_not_input_capability",
     }
 
 
@@ -99,6 +106,9 @@ def parse_control_request(raw):
     cap = raw.get("max_output_tokens")
     if type(cap) is not int or not 1 <= cap <= MAX_CONTROL_OUTPUT_TOKENS:
         raise ValueError()
+    # Validate before Pydantic can serialize dict tool outputs to text and
+    # before either registration or execution can reach VLM preflight.
+    validate_owned_images(raw.get("input"))
     parsed = ResponsesRequest.model_validate(raw)
     if (
         parsed.previous_response_id is not None
@@ -114,6 +124,28 @@ def settings_digest(get_settings_snapshot, model_id):
     if not isinstance(snapshot, dict) or not snapshot:
         raise ValueError()
     return canonical_digest(snapshot)
+
+
+def expected_settings_digest(body):
+    """An optional client restriction, never server capability authority."""
+    if EXPECTED_SETTINGS_FIELD not in body:
+        return None
+    expected = body[EXPECTED_SETTINGS_FIELD]
+    if (
+        type(expected) is not str
+        or len(expected) != SETTINGS_DIGEST_LENGTH
+        or any(character not in SETTINGS_DIGEST_CHARACTERS for character in expected)
+    ):
+        raise ValueError()
+    return expected
+
+
+def settings_changed_response():
+    return JSONResponse(
+        status_code=409,
+        content={"error": {"code": "settings_changed", "message": "Control settings changed"}},
+        headers={"X-Prism-Control-Error": "settings_changed", "Cache-Control": "no-store"},
+    )
 
 
 def server_event(event, data):
@@ -185,6 +217,19 @@ def create_control_router(
                 status_code=401, detail="Valid control API key required"
             )
         return sha256(key.encode("utf-8", "surrogatepass")).hexdigest(), state
+
+    @router.get("/models/{model_id:path}/image-input")
+    def image_input(model_id: str, actor=Depends(authenticated_owner)):
+        try:
+            snapshot = get_settings_snapshot(model_id)
+            capability = snapshot.get("owned_image_input")
+            if not isinstance(capability, dict) or capability.get("model_id") != model_id:
+                raise ValueError()
+            return {**capability, "settings_sha256": canonical_digest(snapshot)}
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=503, detail="Control image capability unavailable") from None
 
     @router.get("/jobs/{job_id}/operations/{operation_id}")
     def registration_status(
@@ -277,10 +322,12 @@ def create_control_router(
                 body = await read_json_body(request, check_deadline)
                 if (
                     not isinstance(body, dict)
-                    or set(body) != {"request"}
+                    or "request" not in body
+                    or not set(body) <= {"request", EXPECTED_SETTINGS_FIELD}
                     or not isinstance(body["request"], dict)
                 ):
                     raise ValueError()
+                expected_hash = expected_settings_digest(body)
                 parsed, request_hash = parse_control_request(body["request"])
                 check_deadline()
             except TimeoutError:
@@ -304,6 +351,8 @@ def create_control_router(
                 raise HTTPException(
                     status_code=503, detail="Control settings unavailable"
                 ) from None
+            if expected_hash is not None and expected_hash != settings_hash:
+                return settings_changed_response()
             try:
                 check_deadline()
                 record = await loop.run_in_executor(
@@ -375,10 +424,12 @@ def create_control_router(
                 body = await read_json_body(request, check_deadline)
                 if (
                     not isinstance(body, dict)
-                    or set(body) != {"request", "admission_timeout_ms"}
+                    or not {"request", "admission_timeout_ms"} <= set(body)
+                    or not set(body) <= {"request", "admission_timeout_ms", EXPECTED_SETTINGS_FIELD}
                     or not isinstance(body["request"], dict)
                 ):
                     raise ValueError()
+                expected_hash = expected_settings_digest(body)
                 budget = body["admission_timeout_ms"]
                 if type(budget) is not int or not 1 <= budget <= MAX_ADMISSION_TIMEOUT_MS:
                     raise ValueError()
@@ -393,15 +444,23 @@ def create_control_router(
                     status_code=400, detail="Invalid control request"
                 ) from None
             try:
-                # Both digests come from this request and current settings,
-                # never from the caller.
-                settings_hash = settings_digest(get_settings_snapshot, parsed.model)
+                # Actual digests and capability authority come from this
+                # request and current settings. The optional client digest
+                # can only restrict which current settings are accepted.
+                settings_snapshot = copy.deepcopy(get_settings_snapshot(parsed.model))
+                if not isinstance(settings_snapshot, dict) or not settings_snapshot:
+                    raise ValueError()
+                settings_hash = canonical_digest(settings_snapshot)
+                image_policy = capture_image_policy(parsed.model, settings_snapshot, settings_hash,
+                    lambda model_id: settings_digest(get_settings_snapshot, model_id))
             except HTTPException:
                 raise
             except Exception:
                 raise HTTPException(
                     status_code=503, detail="Control settings unavailable"
                 ) from None
+            if expected_hash is not None and expected_hash != settings_hash:
+                return settings_changed_response()
             try:
                 execution = coordinator.start(
                     (owner_id, job_id, operation_id),
@@ -410,6 +469,7 @@ def create_control_router(
                     settings_sha256=settings_hash,
                     deadline=entered + budget / 1000,
                     request=parsed,
+                    image_policy=image_policy,
                 )
             except ExecutionExists:
                 raise HTTPException(

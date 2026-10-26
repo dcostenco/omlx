@@ -86,6 +86,17 @@ def _admitted_text_only(request) -> bool:
     return not any(_present(getattr(request, name, None)) for name in ("images", "videos", *_VLM_FIELDS))
 
 
+def _admitted_prepared_vision(request) -> bool:
+    """Request shape only; the caller separately requires completed preparation."""
+    extra = getattr(request, "vlm_extra_kwargs", None)
+    return (
+        not _present(getattr(request, "images", None))
+        and not _present(getattr(request, "videos", None))
+        and getattr(request, "vlm_inputs_embeds", None) is not None
+        and isinstance(extra, dict) and extra.get("position_ids") is not None
+    )
+
+
 class OwnedAdmission:
     """Trusted Python handle; never accepted from public request metadata."""
 
@@ -130,6 +141,8 @@ class OwnedAdmission:
         self._submitted_future = None
         self._request = None
         self._cancelled = False
+        self._preparation_started = False
+        self._preparation_synchronized = False
         self._attempted = False
         self._returned = False
         self._stream_pinned_deadline = None
@@ -145,6 +158,9 @@ class OwnedAdmission:
         self._cleanup_outcome = None
         # 25b.4: fixed at admit(); the executor job records its classification.
         self._text_only = False
+        self._prepared_vision = False
+        # Internal stage opt-in only; never copied from request metadata.
+        self._image_admission = False
         self._classified_state = None
         # Set once scheduling commits the request to compute. A started request
         # that is requeued is no longer pristine and must never stay fenced.
@@ -174,6 +190,38 @@ class OwnedAdmission:
     @property
     def retry(self):
         return self._retry
+
+    @property
+    def cancelled(self):
+        with self._lock:
+            return self._cancelled
+
+    @property
+    def preparation_unresolved(self):
+        with self._lock:
+            return self._preparation_started and not self._preparation_synchronized
+
+    def begin_preparation(self, core, executor):
+        with self._lock:
+            self.validate(core, self.binding.request_id, unused=True, deadline=True)
+            if executor is not self.binding.executor:
+                raise ValueError("owned_preparation_executor_changed")
+            if self._cancelled:
+                raise asyncio.CancelledError()
+            if self._preparation_started:
+                raise ValueError("owned_preparation_already_started")
+            if getattr(self.binding.executor, "_max_workers", None) != 1:
+                raise ValueError("owned_preparation_executor_not_serialized")
+            self._preparation_started = True
+
+    def finish_preparation(self, core):
+        with self._lock:
+            self.validate(core, self.binding.request_id, unused=True)
+            if not self._preparation_started or self._preparation_synchronized:
+                raise ValueError("owned_preparation_not_pending")
+            # Cancellation/deadline fences later insertion, but cannot undo a
+            # synchronization that completed on the captured worker/stream.
+            self._preparation_synchronized = True
 
     def validate(self, core, request_id, *, unused=False, deadline=False):
         b = self.binding
@@ -261,6 +309,10 @@ class OwnedAdmission:
                 raise asyncio.CancelledError()
             self._request = request
             self._text_only = _admitted_text_only(request)
+            self._prepared_vision = (
+                self._preparation_started and self._preparation_synchronized
+                and _admitted_prepared_vision(request)
+            )
             request._prism_owned_admission = self
             # Holding the lock makes the worker wait until the real future is
             # retained. The request also fences retries if submit raises.

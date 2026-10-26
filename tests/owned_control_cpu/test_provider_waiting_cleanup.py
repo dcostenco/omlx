@@ -3,6 +3,7 @@
 
 import ast
 import asyncio
+import inspect
 from collections import deque
 from dataclasses import dataclass
 import logging
@@ -15,6 +16,7 @@ from unittest.mock import Mock
 
 import test_provider_stream_barrier as stream_fixture
 from omlx.owned_admission import OwnedAdmission, RunningCleaned, WaitingCleaned
+from omlx.owned_image_policy import owned_vision_architecture_qualified
 from omlx.request import Request, RequestStatus, RequestOutput
 
 ROOT = stream_fixture.admission_fixture.ROOT
@@ -41,6 +43,7 @@ NAMES = {
     # 27.3: the model-level part, shared with owned preparation.
     "_owned_model_refusal",
     "_owned_running_state",
+    "_owned_vision_refusal",
     "_cleanup_owned_running",
 }
 methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in NAMES]
@@ -61,6 +64,7 @@ proof_class = next(
     if isinstance(n, ast.ClassDef) and n.name == "_WaitingCleanupProof"
 )
 namespace = dict(
+    inspect=inspect,
     Any=Any,
     Optional=Optional,
     dataclass=dataclass,
@@ -70,6 +74,7 @@ namespace = dict(
     OwnedAdmission=OwnedAdmission,
     WaitingCleaned=WaitingCleaned,
     RunningCleaned=RunningCleaned,
+    owned_vision_architecture_qualified=owned_vision_architecture_qualified,
     deque=deque,
     time=time,
     logger=logging.getLogger("waiting-proof"),

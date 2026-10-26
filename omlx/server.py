@@ -343,13 +343,29 @@ def get_control_settings_snapshot(model_id: str) -> dict:
     settings = _server_state.global_settings
     if pool is None or settings is None:
         raise HTTPException(status_code=503, detail="Control settings unavailable")
-    if pool.get_entry(model_id) is None:
+    entry = pool.get_entry(model_id)
+    if entry is None:
         raise HTTPException(status_code=404, detail="Control model unknown")
     per_model = get_model_settings_for_request(model_id)
     if per_model is None:
         raise HTTPException(status_code=503, detail="Control settings unavailable")
+    from .owned_image_policy import (
+        image_input_capability,
+        owned_vision_architecture_qualified,
+    )
+    # Cold configuration excludes transient leases/residency: an operation's
+    # own image lease must not invalidate the settings digest it is bound to.
+    image_enabled = (entry.engine_type == "vlm" and entry.model_type == "vlm"
+        and owned_vision_architecture_qualified(getattr(entry, "config_model_type", None))
+        and owned_entry_refusal(entry, per_model,
+            distributed=pool._distributed_deployment_for_entry(entry) is not None,
+            diffusion=pool._entry_is_diffusion_model(entry),
+            signature=lambda: pool._engine_runtime_signature(model_id, per_model),
+            submit_failures=0) is None)
     return {
         "snapshot_version": 1,
+        "owned_image_input": image_input_capability(model_id, enabled=image_enabled,
+            context_tokens=_configured_max_context_window(model_id)),
         "model_settings": per_model.to_dict(),
         "sampling_defaults": asdict(_server_state.sampling),
         "global_settings": {
@@ -807,7 +823,7 @@ from .api.prism_control_routes import (
     configure_control_store,
     create_control_router,
 )
-from .owned_preparation import make_admission_stage, owned_request_refusal
+from .owned_preparation import make_admission_stage, owned_request_refusal, owned_entry_refusal
 from .admin.auth import verify_any_api_key
 from .utils.network import is_loopback_bind
 

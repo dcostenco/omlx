@@ -22,6 +22,39 @@ carried forward. The same Apache-2.0 license applies.
   sends it for classifier reads, which are read once.
 - **Flash-Next (`qwen4_exp`).** Owned admission for this model family.
 
+## Owned image requests
+
+The authenticated endpoint
+`/prism-control/v1/models/{model_id}/image-input` reports whether the exact model
+and current server configuration support the `owned-png-v1` input contract.
+A model's name or vision tag alone does not establish support. The server
+captures the applicable settings and refuses changed settings, unsupported
+configuration or concurrent model work. Request fields cannot enable support.
+To keep multiple operations bound to that capability snapshot, clients send its
+digest as top-level `expected_settings_sha256` on both registration and execution.
+A mismatch returns HTTP 409 with `X-Prism-Control-Error: settings_changed`
+before registration or execution claim; the field cannot grant capability.
+
+Supported input consists of inline PNG images in user messages. Remote URLs,
+filesystem paths, tool-output images, other formats and malformed images are
+refused. The limits are four images, 128 KiB per image, 192 KiB combined,
+2048 pixels per side, 4,194,304 pixels per image and 8,388,608 combined pixels.
+The 256 KiB serialized HTTP body limit also applies, including base64 expansion
+and the rest of the request. Validation does not resize or convert images.
+
+An image request reserves its model exclusively until backend stop is proven.
+Ordinary and other owned acquisitions return busy while that reservation is
+held. Cancellation or a caller timeout does not by itself prove that backend
+work stopped. Unresolved work retains its reservation and may require recovery;
+it must not be treated as idle or safely evictable. Text-only requests retain
+their existing behavior.
+
+The capability response describes accepted input, not visual accuracy or
+universal memory fit. Clients must retain their resource checks and handle
+refusal. Image validation and decoding can currently run on the API event loop.
+Keep requests within the published limits. Server capability discovery does not
+activate or update a client installation.
+
 ## Install
 
 From source, as upstream describes, from this fork's stable integration branch after it is published:
