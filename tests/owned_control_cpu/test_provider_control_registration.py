@@ -269,7 +269,7 @@ class RegistrationTests(unittest.TestCase):
 
         def inventory(model):
             seen.append(model)
-            return object() if model == REQUEST["model"] else None
+            return SimpleNamespace(engine_type="batched", model_type="llm") if model == REQUEST["model"] else None
 
         state = SimpleNamespace(
             engine_pool=SimpleNamespace(get_entry=inventory),
@@ -277,7 +277,9 @@ class RegistrationTests(unittest.TestCase):
             sampling=Config(12),
         )
         scope = {
+            "__name__": "omlx.server",
             "_server_state": state,
+            "_configured_max_context_window": lambda model: 8192,
             "asdict": asdict,
             "HTTPException": support.auth.HTTPException,
             "get_model_settings_for_request": lambda model: SimpleNamespace(

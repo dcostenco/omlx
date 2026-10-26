@@ -14,6 +14,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import importlib.abc
+import inspect
 import logging
 import os
 from pathlib import Path
@@ -683,6 +684,7 @@ class ModelRefusalTests(unittest.TestCase):
         self.assertEqual(len(nodes), 2)
         state = dict(drafter=None)
         names = dict(
+            inspect=inspect,
             _mtp_priming=SimpleNamespace(_eligible_host=lambda model: None),
             _model_mtp_decode_enabled=lambda model: False,
             _block_drafter_for=lambda model: state["drafter"],
@@ -703,7 +705,7 @@ class ModelRefusalTests(unittest.TestCase):
             def _owned_admission_complete(self, owned, request):
                 return True
 
-        owned = SimpleNamespace(_lock=threading.Lock(), _text_only=True)
+        owned = SimpleNamespace(_lock=threading.Lock(), _text_only=True, _prepared_vision=False)
         request = SimpleNamespace(rope_deltas=0)
         s = Scheduler()
         self.assertEqual((s._owned_model_refusal(), s._owned_running_refusal(owned, request, "r")), (None, None))
@@ -955,6 +957,12 @@ class DifferentialTests(unittest.TestCase):
         old_lock = next(s for s in old.body if isinstance(s, ast.AsyncWith))
         helper = next(n for n in POOL_CLASS.body if getattr(n, "name", "") == "_get_engine_locked")
         body = [s for s in helper.body if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant))]
+        image_guards = [s for s in body if isinstance(s, ast.If)
+                        and ast.unparse(s.test) == "getattr(entry, 'owned_image_active', False)"]
+        self.assertEqual(len(image_guards), 1)
+        self.assertEqual(ast.unparse(image_guards[0].body[0]),
+                         "raise ModelBusyError(model_id, 'start work during owned image execution')")
+        body = [s for s in body if s not in image_guards]
 
         def strip_guard(node):
             for child in ast.walk(node):

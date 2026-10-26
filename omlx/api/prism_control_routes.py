@@ -5,6 +5,7 @@ from dataclasses import asdict
 from functools import partial
 from hashlib import sha256
 import asyncio
+import copy
 import json
 import time
 
@@ -27,6 +28,8 @@ from .prism_control_store import (
     ControlCapacity,
 )
 from .responses_models import ResponsesRequest
+from ..owned_images import validate_owned_images
+from ..owned_image_policy import capture_image_policy
 from .utils import find_lone_surrogate
 
 MAX_CREDENTIAL_BYTES = 4096
@@ -56,6 +59,7 @@ def registration_payload(record):
         "engine_generation_verified": False,
         "provider_qualified": False,
         "production_enabled": False,
+        "qualification_scope": "registration_only_not_input_capability",
     }
 
 
@@ -99,6 +103,9 @@ def parse_control_request(raw):
     cap = raw.get("max_output_tokens")
     if type(cap) is not int or not 1 <= cap <= MAX_CONTROL_OUTPUT_TOKENS:
         raise ValueError()
+    # Validate before Pydantic can serialize dict tool outputs to text and
+    # before either registration or execution can reach VLM preflight.
+    validate_owned_images(raw.get("input"))
     parsed = ResponsesRequest.model_validate(raw)
     if (
         parsed.previous_response_id is not None
@@ -185,6 +192,19 @@ def create_control_router(
                 status_code=401, detail="Valid control API key required"
             )
         return sha256(key.encode("utf-8", "surrogatepass")).hexdigest(), state
+
+    @router.get("/models/{model_id:path}/image-input")
+    def image_input(model_id: str, actor=Depends(authenticated_owner)):
+        try:
+            snapshot = get_settings_snapshot(model_id)
+            capability = snapshot.get("owned_image_input")
+            if not isinstance(capability, dict) or capability.get("model_id") != model_id:
+                raise ValueError()
+            return {**capability, "settings_sha256": canonical_digest(snapshot)}
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=503, detail="Control image capability unavailable") from None
 
     @router.get("/jobs/{job_id}/operations/{operation_id}")
     def registration_status(
@@ -395,7 +415,12 @@ def create_control_router(
             try:
                 # Both digests come from this request and current settings,
                 # never from the caller.
-                settings_hash = settings_digest(get_settings_snapshot, parsed.model)
+                settings_snapshot = copy.deepcopy(get_settings_snapshot(parsed.model))
+                if not isinstance(settings_snapshot, dict) or not settings_snapshot:
+                    raise ValueError()
+                settings_hash = canonical_digest(settings_snapshot)
+                image_policy = capture_image_policy(parsed.model, settings_snapshot, settings_hash,
+                    lambda model_id: settings_digest(get_settings_snapshot, model_id))
             except HTTPException:
                 raise
             except Exception:
@@ -410,6 +435,7 @@ def create_control_router(
                     settings_sha256=settings_hash,
                     deadline=entered + budget / 1000,
                     request=parsed,
+                    image_policy=image_policy,
                 )
             except ExecutionExists:
                 raise HTTPException(

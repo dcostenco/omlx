@@ -1,22 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Owned preparation: exact-model engine acquisition for control executions.
+"""Owned preparation/admission using exact-model engine leases.
 
-Engine-free. The pool's ``acquire_owned`` applies these refusals and returns an
-``OwnedLease``; the preparation stage owns that lease and releases it exactly
-once. Until owned admission exists, the stage prepares, releases and reports
-that nothing reached the scheduler.
+Leases are retired after backend facts settle. Unproved image execution and
+preparation synchronization retain their leases rather than mark an engine idle.
 """
 
 from dataclasses import dataclass
+from functools import partial
 import asyncio
 import time
 
+from .owned_image_cache import without_image_cache
+from .owned_image_admission import (
+    owned_image_sources,
+    prepared_image_sources,
+    require_owned_image_quiescence,
+)
 from .api.prism_control_coordinator import (
     DRAIN_WINDOW_SECONDS,
     EngineStageUnavailable,
     _settle,
 )
 from .host_submit import submission_failures
+from .owned_preparation_wait import wait_owned_preparation
 from .owned_admission import (
     OwnedAdmission,
     RunningCleaned,
@@ -101,7 +107,9 @@ def owned_loaded_variant_refusal(entry):
     family = owned_family(entry)
     if family not in PRESSURE_OVERRIDE_FAMILIES:
         return None
-    return owned_signature_refusal(family, getattr(entry, "runtime_settings_signature", None))
+    return owned_signature_refusal(
+        family, getattr(entry, "runtime_settings_signature", None)
+    )
 
 
 class OwnedPreparationRefused(Exception):
@@ -222,7 +230,9 @@ def make_preparation_stage(get_pool):
 
 READ_SLICE_SECONDS = 0.25
 ABSENCE_POLL_SECONDS = 0.02
-_MEDIA_PART_TYPES = frozenset({"input_image", "input_file", "image_url", "file", "input_audio"})
+_MEDIA_PART_TYPES = frozenset(
+    {"input_image", "input_file", "image_url", "file", "input_audio"}
+)
 
 
 class ExecutionUnresolved(Exception):
@@ -235,11 +245,11 @@ def _is_error(output):
     ) in ("error", "abort")
 
 
-def owned_request_refusal(request, *, quantizing=False):
+def owned_request_refusal(request, *, quantizing=False, allow_images=False):
     """The reason owned work refuses a registered request, or None.
 
-    Text-only work without tools or a response format; everything else is
-    refused before any engine work.
+    The default is text-only. Exactly True permits strict user-message PNGs
+    for a trusted caller; no request field supplies this capability.
     """
     if quantizing:
         return "quantizing"
@@ -248,11 +258,19 @@ def owned_request_refusal(request, *, quantizing=False):
     text = getattr(request, "text", None)
     if text is not None and getattr(text, "format", None) is not None:
         return "text_format"
-    stack = [request.model_dump(mode="json").get("input")]
+    if allow_images is True:
+        try:
+            owned_image_sources(request, plain_only=True)
+        except ValueError:
+            return "media_input"
+    value = request.model_dump(mode="json").get("input")
+    stack = [value]
     while stack:
         value = stack.pop()
         if isinstance(value, dict):
             if value.get("type") in _MEDIA_PART_TYPES:
+                if value.get("type") == "input_image" and allow_images is True:
+                    continue
                 return "media_input"
             stack.extend(value.values())
         elif isinstance(value, list):
@@ -301,6 +319,63 @@ async def _join(execution, core, handle, deadline):
         execution.cancellations.append(None)
         joined = await handle.join(core, deadline)
     return joined
+
+
+async def _retire_late_admission(execution, core, handle):
+    """Retain a missed admission's work; never restore its expired stop proof."""
+    handle.cancel()
+    try:
+        await _settle(asyncio.wrap_future(handle.future), execution.cancellations)
+    except (asyncio.CancelledError, Exception):
+        pass
+    # A dispatch already past its fence can still insert after its caller's
+    # deadline. It must have an owner and a cleanup consumer before release.
+    with handle._lock:
+        attempted = handle._attempted
+    if attempted:
+        execution.admitted = True
+        _start_cleanup(execution, core, handle)
+        try:
+            await _settle(execution.cleanup_task, execution.cancellations)
+        except (asyncio.CancelledError, Exception):
+            pass
+        # The cleanup coroutine has its own bounded wait; retain its actual
+        # executor job too if that wait expired before the worker finished.
+        future = handle._cleanup_future
+        if future is not None:
+            try:
+                await _settle(asyncio.wrap_future(future), execution.cancellations)
+            except (asyncio.CancelledError, Exception):
+                pass
+    while True:
+        try:
+            await _settle(
+                asyncio.create_task(
+                    _absent(
+                        execution, core, handle, time.monotonic() + DRAIN_WINDOW_SECONDS
+                    )
+                ),
+                execution.cancellations,
+            )
+            break
+        except ExecutionUnresolved:
+            # A probe's bounded coroutine may end before its executor job.
+            # Retain that job before retrying with a fresh absence window.
+            future = handle._probe_future
+            if future is not None:
+                try:
+                    await _settle(asyncio.wrap_future(future), execution.cancellations)
+                except (asyncio.CancelledError, Exception):
+                    pass
+            await _settle(
+                asyncio.create_task(asyncio.sleep(READ_SLICE_SECONDS)),
+                execution.cancellations,
+            )
+    if attempted:
+        core._cleanup_request(execution.claim.request_id)
+    else:
+        # An unattempted dispatch may still have registered a collector.
+        core.release_owned_failure(handle)
 
 
 async def _read(execution, core, collector):
@@ -366,26 +441,6 @@ async def _admit(execution, pool, prepare_chat, submit_failures):
     cancellations = execution.cancellations
     if _unload_requested(pool, model_id):
         raise EngineStageUnavailable()
-    try:
-        prepared = await prepare_chat(engine, execution.request, model_id)
-        messages, chat_kwargs = prepared.messages, dict(prepared.chat_kwargs)
-        if getattr(execution.request, "prompt_cache_retention", None) == "none":
-            # Never stored at completion, as the admin benchmarks do: no cache
-            # entry persists. A request longer than one cache block can still
-            # write temporary boundary snapshots while it runs; the scheduler
-            # removes them when it ends. A classifier request is unique and
-            # never reused.
-            chat_kwargs["skip_cache_store"] = True
-        await engine.preflight_chat(messages, request_id=None, **chat_kwargs)
-    except asyncio.CancelledError:
-        # Nothing was dispatched; counted as the coordinator counts verify's.
-        cancellations.append(None)
-        raise EngineStageUnavailable() from None
-    except Exception:
-        # Nothing was dispatched: a template, context or prefill refusal.
-        raise EngineStageUnavailable() from None
-    if _unload_requested(pool, model_id):
-        raise EngineStageUnavailable()
     core = pool._resolve_engine_core_from_engine(engine)
     request_id = execution.claim.request_id
     try:
@@ -393,9 +448,8 @@ async def _admit(execution, pool, prepare_chat, submit_failures):
             core,
             request_id,
             execution.deadline,
-            # 28: a pressure family (Flash-Next) never re-runs owned work.
-            retry=owned_family(pool.get_entry(model_id)) not in PRESSURE_OVERRIDE_FAMILIES,
-            # 28: the executor dispatch admits nothing once this has moved.
+            retry=owned_family(pool.get_entry(model_id))
+            not in PRESSURE_OVERRIDE_FAMILIES,
             submit_failures=submit_failures,
         )
     except (ValueError, AttributeError):
@@ -403,12 +457,63 @@ async def _admit(execution, pool, prepare_chat, submit_failures):
 
     def fence():
         handle.cancel()
-        # A cancel after the output finished leaves termination to prove it.
         if execution.admitted and execution.final_output is None:
             _start_cleanup(execution, core, handle)
 
-    # Publish before the final verify [slice 26 F2-1].
+    # Publish before preparation too: preflight may await executor work.
     execution.publish_fence(fence)
+    execution.preparation_handle = handle
+    try:
+        image_sources = owned_image_sources(execution.request)
+    except ValueError:
+        raise EngineStageUnavailable() from None
+    if image_sources:
+        with handle._lock:
+            handle._image_admission = True
+
+    async def observe_images():
+        return await asyncio.get_running_loop().run_in_executor(
+            handle.binding.executor,
+            partial(require_owned_image_quiescence, handle, core),
+        )
+
+    async def prepare():
+        before = await observe_images() if image_sources else None
+        prepared = await prepare_chat(engine, execution.request, model_id)
+        messages, chat_kwargs = prepared.messages, dict(prepared.chat_kwargs)
+        if prepared_image_sources(messages) != image_sources:
+            raise ValueError("owned_image_sources_changed")
+        if getattr(execution.request, "prompt_cache_retention", None) == "none":
+            # Never stored at completion, as the admin benchmarks do: no cache
+            # entry persists. A request longer than one cache block can still
+            # write temporary boundary snapshots while it runs; the scheduler
+            # removes them when it ends. A classifier request is unique and
+            # never reused.
+            chat_kwargs["skip_cache_store"] = True
+        with without_image_cache():
+            await engine.preflight_chat(messages, request_id=None, **chat_kwargs)
+        if image_sources:
+            after = await observe_images()
+            if len(before) != len(after) or any(
+                a is not b for a, b in zip(before, after)
+            ):
+                raise ValueError("owned_image_preflight_state_changed")
+        return messages, chat_kwargs
+
+    cancellation_count = len(cancellations)
+    try:
+        messages, chat_kwargs = await wait_owned_preparation(
+            execution, handle, prepare()
+        )
+    except asyncio.CancelledError:
+        if len(cancellations) == cancellation_count:
+            cancellations.append(None)
+        raise EngineStageUnavailable() from None
+    except Exception:
+        # Nothing was dispatched: a template, context or prefill refusal.
+        raise EngineStageUnavailable() from None
+    if handle.cancelled or _unload_requested(pool, model_id):
+        raise EngineStageUnavailable()
     try:
         await execution.verify()
     except asyncio.CancelledError:
@@ -420,14 +525,25 @@ async def _admit(execution, pool, prepare_chat, submit_failures):
         raise EngineStageUnavailable()
 
     before = asyncio.current_task().cancelling()
+    cancellation_count = len(cancellations)
     try:
-        await engine.admit_owned_chat(
-            messages, admission=handle, request_id=request_id, **chat_kwargs
+        await wait_owned_preparation(
+            execution,
+            handle,
+            engine.admit_owned_chat(
+                messages, admission=handle, request_id=request_id, **chat_kwargs
+            ),
         )
     except BaseException:
         # The outcome comes from the joined facts, never from the exception.
-        if asyncio.current_task().cancelling() > before:
+        if (
+            asyncio.current_task().cancelling() > before
+            and len(cancellations) == cancellation_count
+        ):
             cancellations.append(None)
+
+    if handle.preparation_unresolved:
+        raise ExecutionUnresolved("preparation_synchronization_unproved")
 
     deadline = _drain_deadline(execution)
     joined = await _join(execution, core, handle, deadline)
@@ -436,6 +552,7 @@ async def _admit(execution, pool, prepare_chat, submit_failures):
         core.release_owned_failure(handle)
         raise EngineStageUnavailable()
     if joined is None:
+        await _retire_late_admission(execution, core, handle)
         raise ExecutionUnresolved("admission_unjoinable")
     if joined.admission_failed:
         result = await core.probe_owned_absence(handle, deadline)
@@ -517,15 +634,23 @@ async def _terminal_facts(execution, core, handle, final):
         # An owned cleanup never marks the request finished, so the reaper
         # never drops this collector; nothing reads it any more.
         core._cleanup_request(request_id)
-        if type(await core._owned_stream_barrier(handle, deadline)) is not StreamSynchronized:
+        if (
+            type(await core._owned_stream_barrier(handle, deadline))
+            is not StreamSynchronized
+        ):
             raise ExecutionUnresolved("barrier_refused")
-        cleaned = "waiting_cleaned" if type(fact) is WaitingCleaned else "running_cleaned"
+        cleaned = (
+            "waiting_cleaned" if type(fact) is WaitingCleaned else "running_cleaned"
+        )
         return "cancelled", (cleaned, "stream_synchronized")
     if final is None:
         raise ExecutionUnresolved("no_final_output")
     await _absent(execution, core, handle, deadline)
     # The barrier's one job is submitted only now, after absence is proved.
-    if type(await core._owned_stream_barrier(handle, deadline)) is not StreamSynchronized:
+    if (
+        type(await core._owned_stream_barrier(handle, deadline))
+        is not StreamSynchronized
+    ):
         raise ExecutionUnresolved("barrier_refused")
     # Tracking is retired by _terminate only after the host-read check too.
     if _is_error(final):
@@ -542,19 +667,39 @@ def make_admission_stage(get_pool, prepare_chat, refusal):
     """
 
     async def stage(execution):
+        from .owned_image_policy import OwnedImagePolicy
+
         pool = get_pool()
-        if (
-            pool is None
-            or execution.request is None
-            or refusal(execution.request) is not None
-        ):
+        policy = getattr(execution, "image_policy", None)
+        reason = (
+            refusal(execution.request) if execution.request is not None else "request"
+        )
+        image_authorized = type(policy) is OwnedImagePolicy and policy.permits(
+            execution.model_id, execution.settings_sha256
+        )
+        if reason == "media_input" and image_authorized:
+            reason = owned_request_refusal(execution.request, allow_images=True)
+        if pool is None or execution.request is None or reason is not None:
             raise EngineStageUnavailable()
         cancellations = execution.cancellations
         # Read before acquisition, which refuses when it is already non-zero.
         submit_failures = submission_failures()
+        image_lease = False
+        retain_image_lease = False
         try:
+            acquire = pool.acquire_owned
+            if image_authorized:
+                try:
+                    image_sources = owned_image_sources(execution.request)
+                except ValueError:
+                    raise EngineStageUnavailable() from None
+                if image_sources:
+                    acquire = getattr(pool, "acquire_owned_image", None)
+                    if not callable(acquire):
+                        raise EngineStageUnavailable()
+                    image_lease = True
             task = asyncio.ensure_future(
-                pool.acquire_owned(execution.model_id, fence=execution.verify)
+                acquire(execution.model_id, fence=execution.verify)
             )
             try:
                 execution.lease = await _settle(task, cancellations)
@@ -562,12 +707,28 @@ def make_admission_stage(get_pool, prepare_chat, refusal):
                 await _join_reclaim(execution, refused.reclaim, cancellations)
                 raise EngineStageUnavailable() from None
             return await _admit(execution, pool, prepare_chat, submit_failures)
+        except BaseException as error:
+            # The exclusive engine must remain unavailable until stop is
+            # proved. Other unresolved stages can still own device work.
+            retain_image_lease = (
+                image_lease
+                and execution.lease is not None
+                and not isinstance(error, EngineStageUnavailable)
+            )
+            raise
         finally:
-            lease, execution.lease = execution.lease, None
-            if lease is not None:
-                await _settle(
-                    asyncio.ensure_future(pool.release_engine(lease.model_id)),
-                    cancellations,
-                )
+            handle = getattr(execution, "preparation_handle", None)
+            if handle is not None and handle.preparation_unresolved:
+                # The Python worker settled without GPU stop proof. Keep the
+                # actual lease on this unresolved execution; never make this
+                # engine idle/evictable or publish NOT_ADMITTED from the error.
+                raise ExecutionUnresolved("preparation_synchronization_unproved")
+            if not retain_image_lease:
+                lease, execution.lease = execution.lease, None
+                if lease is not None:
+                    await _settle(
+                        asyncio.ensure_future(pool.release_engine(lease.model_id)),
+                        cancellations,
+                    )
 
     return stage

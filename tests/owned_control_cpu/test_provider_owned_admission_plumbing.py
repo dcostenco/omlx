@@ -12,6 +12,8 @@ templates, tokenizers and VLM encoders are stubs.
 import __future__
 import ast
 import asyncio
+import contextlib
+import functools
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
@@ -24,6 +26,7 @@ from unittest.mock import Mock
 import test_provider_waiting_cleanup as waiting_fixture
 import omlx_engine_stream_757b68e as baseline
 from omlx.owned_admission import OwnedAdmission, StreamSynchronized
+from omlx.owned_vision_preparation import prepare_owned_vision
 from omlx.request import Request, SamplingParams
 
 ROOT = waiting_fixture.ROOT
@@ -49,6 +52,9 @@ ENGINE_NS = dict(
     __package__="omlx.engine",
     __name__="omlx.engine._owned_admission_plumbing_test",
     asyncio=asyncio,
+    functools=functools,
+    prepare_owned_vision=prepare_owned_vision,
+    mx=SimpleNamespace(stream=lambda stream: contextlib.nullcontext(), synchronize=lambda stream: None),
     logger=logging.getLogger("owned-admission-plumbing"),
     convert_tools_for_template=lambda tools: [("template", tool) for tool in tools],
     clean_special_tokens=lambda text: text,
@@ -84,6 +90,15 @@ class FakeCore:
         self.aborted = []
         self.streamed = []
         self._mlx_executor = ThreadPoolExecutor(1, thread_name_prefix="fake-mlx")
+        self._mlx_stream = object()
+        self._engine_id = "synthetic-plumbing-engine"
+        self._prism_control_generation_id = "synthetic-plumbing-generation"
+        self.scheduler = SimpleNamespace(requests={})
+        self._closed = self._closing = False
+
+    @property
+    def engine(self):
+        return self
 
     async def add_request(self, **kwargs):
         self.added.append(kwargs)
@@ -222,7 +237,7 @@ async def drive_owned(engine_class, host_class, scenario, *, request_id="claim-r
     instance._loaded = loaded
     spec = dict(scenario)
     messages = spec.pop("messages")
-    handle = object()
+    handle = OwnedAdmission(core, request_id, time.monotonic() + 10)
     await instance.admit_owned_chat(messages, admission=handle, request_id=request_id, **spec)
     return core, instance, handle
 

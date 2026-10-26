@@ -306,6 +306,51 @@ class AdmissionStageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.engine.admits, self.pool.releases), ([], ["m"]))
         self.assertEqual(self.core._output_collectors, {})
 
+    async def test_cancel_during_executor_preparation_keeps_lease_until_work_settles(self):
+        started, release, completed = threading.Event(), threading.Event(), threading.Event()
+        original_admit = self.engine.admit_owned_chat
+        scheduler_add = Mock(wraps=self.s.add_request)
+        self.s.add_request = scheduler_add
+
+        def prepare():
+            started.set()
+            if not release.wait(3):
+                raise TimeoutError("test did not release preparation")
+            completed.set()
+
+        async def delayed_admit(messages, **kwargs):
+            await asyncio.get_running_loop().run_in_executor(self.core._mlx_executor, prepare)
+            await original_admit(messages, **kwargs)
+
+        self.engine.admit_owned_chat = delayed_admit
+        execution = self.execution()
+        # Hold work beyond the pre-change drain window, which used to allow
+        # an early not-started result. The corrected path starts no drain yet.
+        drain_patch = mock.patch.object(prep, "DRAIN_WINDOW_SECONDS", 0.03)
+        drain_patch.start()
+        task = asyncio.create_task(self.stage(execution))
+        try:
+            await self.until(started.is_set)
+            task.cancel()
+            await self.until(lambda: bool(execution.cancellations))
+            await asyncio.wait((task,), timeout=0.08)
+            self.assertFalse(task.done(), "cannot report stopped while preparation runs")
+            self.assertEqual(self.pool.releases, [], "the running worker still owns its engine")
+            self.assertFalse(completed.is_set())
+            self.assertIsNone(execution.drain_deadline)
+            release.set()
+            with self.assertRaises(coord.EngineStageUnavailable):
+                await task
+            self.assertTrue(completed.is_set())
+            scheduler_add.assert_not_called()
+            self.assertEqual(execution.cancellations, [None])
+            self.assertEqual(self.pool.releases, ["m"])
+            self.assertEqual(self.s.requests, {})
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            drain_patch.stop()
+
     async def test_unload_requests_are_checked_before_and_after_the_preflight_and_before_admission(self):
         cases = {
             "before preflight": lambda ex: setattr(self.pool.entry, "pending_unload_reason", "manual unload"),
@@ -425,17 +470,140 @@ class AdmissionStageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ex.cancellations), 1)
         self.assertNotIn("synthetic-task-cancel", self.s.requests)
 
-    async def test_an_unjoinable_admission_publishes_nothing(self):
+    async def test_an_unjoinable_admission_retains_the_lease_until_dispatch_settles(self):
         gate = threading.Event()
         blocker = self.core._mlx_executor.submit(gate.wait, 5)
-        ex = self.execution(rid="synthetic-unjoinable", seconds=0.3)
-        with mock.patch.object(prep, "DRAIN_WINDOW_SECONDS", 0.2):
-            with self.assertRaises(prep.ExecutionUnresolved) as caught:
-                await self.stage(ex)
-        self.assertEqual(str(caught.exception), "admission_unjoinable")
+        ex = self.execution(rid="synthetic-unjoinable", seconds=0.04)
+        with mock.patch.object(prep, "DRAIN_WINDOW_SECONDS", 0.04):
+            task = asyncio.create_task(self.stage(ex))
+            try:
+                await self.until(lambda: self.engine.admits)
+                await self.until(lambda: self.engine.last_admission._cancelled)
+                await asyncio.wait((task,), timeout=0.10)
+                self.assertFalse(task.done())
+                self.assertEqual(self.pool.releases, [])
+                self.assertFalse(self.engine.last_admission.future.done())
+                gate.set()
+                with self.assertRaisesRegex(prep.ExecutionUnresolved, "admission_unjoinable"):
+                    await task
+            finally:
+                gate.set()
+                await asyncio.gather(task, return_exceptions=True)
         self.assertEqual(self.pool.releases, ["m"])
-        gate.set()
         blocker.result()
+
+    async def test_cancel_during_preflight_keeps_the_lease_until_executor_work_settles(self):
+        started, release, completed = threading.Event(), threading.Event(), threading.Event()
+
+        def work():
+            started.set()
+            if not release.wait(3):
+                raise TimeoutError("test did not release preflight")
+            completed.set()
+
+        async def preflight(*args, **kwargs):
+            await asyncio.get_running_loop().run_in_executor(self.core._mlx_executor, work)
+
+        self.engine.preflight_chat = preflight
+        ex = self.execution(rid="synthetic-preflight")
+        task = asyncio.create_task(self.stage(ex))
+        try:
+            await self.until(started.is_set)
+            task.cancel()
+            await self.until(lambda: bool(ex.cancellations))
+            await asyncio.wait((task,), timeout=0.08)
+            self.assertFalse(task.done())
+            self.assertEqual(self.pool.releases, [])
+            release.set()
+            with self.assertRaises(coord.EngineStageUnavailable):
+                await task
+            self.assertTrue(completed.is_set())
+            self.assertEqual(ex.cancellations, [None])
+            self.assertEqual(self.engine.admits, [])
+            self.assertEqual(self.pool.releases, ["m"])
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cancellation_in_the_late_probe_retains_its_executor_and_counts_once(self):
+        gate, probe_gate = threading.Event(), threading.Event()
+        self.core._mlx_executor.submit(gate.wait, 5)
+        ex = self.execution(rid="synthetic-late-probe-cancel", seconds=0.04)
+        entered = asyncio.Event()
+        original_probe = self.core.probe_owned_absence
+        original_release = self.pool.release_engine
+        probe_done_at_release = []
+
+        async def probe(owned, deadline):
+            if owned.future is not None and owned.future.done() and not entered.is_set():
+                self.core._mlx_executor.submit(probe_gate.wait, 5)
+                entered.set()
+            return await original_probe(owned, deadline)
+
+        async def release_engine(model_id):
+            probe_done_at_release.append(self.engine.last_admission._probe_future.done())
+            await original_release(model_id)
+
+        self.core.probe_owned_absence = probe
+        self.core.release_owned_failure = Mock(wraps=self.core.release_owned_failure)
+        self.pool.release_engine = release_engine
+        with mock.patch.object(prep, "DRAIN_WINDOW_SECONDS", 0.04):
+            task = asyncio.create_task(self.stage(ex))
+            try:
+                await self.until(lambda: self.engine.admits)
+                await self.until(lambda: self.engine.last_admission._cancelled)
+                await asyncio.wait((task,), timeout=0.10)
+                gate.set()
+                await self.until(entered.is_set)
+                task.cancel()
+                await asyncio.wait((task,), timeout=0.10)
+                self.assertFalse(task.done())
+                self.assertEqual(self.pool.releases, [])
+                probe_gate.set()
+                with self.assertRaisesRegex(prep.ExecutionUnresolved, "admission_unjoinable"):
+                    await asyncio.wait_for(task, 2)
+                self.assertEqual(ex.cancellations, [None])
+                self.assertEqual(probe_done_at_release, [True])
+                self.core.release_owned_failure.assert_called_once()
+                self.assertNotIn(ex.claim.request_id, self.core._output_collectors)
+            finally:
+                gate.set()
+                probe_gate.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+    async def test_insertion_after_the_drain_window_is_retired_before_lease_release(self):
+        gate = self.blocking_insert()
+        rid = "synthetic-late-unjoinable"
+        ex = self.execution(rid=rid, seconds=0.04)
+        live_at_release = []
+        release_engine = self.pool.release_engine
+
+        async def recording_release(model_id):
+            live_at_release.append(rid in self.s.requests)
+            await release_engine(model_id)
+
+        self.pool.release_engine = recording_release
+        with mock.patch.object(prep, "DRAIN_WINDOW_SECONDS", 0.04):
+            task = asyncio.create_task(self.stage(ex))
+            try:
+                await self.until(lambda: self.engine.admits)
+                handle = self.engine.last_admission
+                await self.until(lambda: handle._attempted)
+                await self.until(lambda: handle._cancelled)
+                await asyncio.wait((task,), timeout=0.10)
+                self.assertFalse(task.done())
+                self.assertEqual(self.pool.releases, [])
+                gate.set()
+                with self.assertRaisesRegex(prep.ExecutionUnresolved, "admission_unjoinable"):
+                    await asyncio.wait_for(task, 2)
+                self.assertTrue(handle._returned)
+                self.assertEqual(live_at_release, [False])
+                self.assertNotIn(rid, self.core._output_collectors)
+                self.assertNotIn(rid, self.core._stream_states)
+                self.assertNotIn(rid, self.core._finished_events)
+            finally:
+                gate.set()
+                await asyncio.gather(task, return_exceptions=True)
 
     async def test_a_late_admission_is_treated_as_admitted(self):
         self.engine.after_admit_error = RuntimeError("synthetic late failure")
@@ -447,6 +615,42 @@ class AdmissionStageTests(unittest.IsolatedAsyncioTestCase):
         self.finish_in_scheduler("synthetic-late")
         self.assertEqual(await asyncio.wait_for(task, 5), COMPLETED)
         self.assertEqual([e[0] for e in ex.events], ["delta", "finished"])
+
+    async def test_late_cleanup_refusal_retains_ownership_until_the_exact_request_finishes(self):
+        gate = self.blocking_insert()
+        rid = "synthetic-refused-late-cleanup"
+        ex = self.execution(rid=rid, seconds=0.04)
+        other = SimpleNamespace(request_id="unrelated")
+        self.s.requests["unrelated"] = other
+
+        def refuse(owned):
+            owned._cleanup_outcome = "unsupported"
+            return None
+
+        self.s._cleanup_owned_waiting = refuse
+        with mock.patch.object(prep, "DRAIN_WINDOW_SECONDS", 0.04):
+            task = asyncio.create_task(self.stage(ex))
+            try:
+                await self.until(lambda: self.engine.admits)
+                await self.until(lambda: self.engine.last_admission._attempted)
+                await self.until(lambda: self.engine.last_admission._cancelled)
+                await asyncio.wait((task,), timeout=0.10)
+                gate.set()
+                await self.until(lambda: ex.cleanup_task is not None and ex.cleanup_task.done())
+                self.assertFalse(task.done())
+                self.assertEqual(self.pool.releases, [])
+                self.assertIn(rid, self.s.requests)
+                self.assertIs(self.s.requests["unrelated"], other)
+                self.finish_in_scheduler(rid)
+                with self.assertRaisesRegex(prep.ExecutionUnresolved, "admission_unjoinable"):
+                    await asyncio.wait_for(task, 2)
+                self.assertNotIn(rid, self.core._output_collectors)
+                self.assertIs(self.s.requests["unrelated"], other)
+                self.assertEqual(self.pool.releases, ["m"])
+            finally:
+                gate.set()
+                self.s.requests.pop(rid, None)
+                await asyncio.gather(task, return_exceptions=True)
 
     async def test_a_fence_after_admission_starts_one_cleanup_and_stops_the_reader(self):
         ex = self.execution(rid="synthetic-fenced")

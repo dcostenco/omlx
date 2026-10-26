@@ -3,6 +3,7 @@
 
 import ast
 import asyncio
+import inspect
 from collections import deque
 from dataclasses import dataclass
 import logging
@@ -41,6 +42,7 @@ NAMES = {
     # 27.3: the model-level part, shared with owned preparation.
     "_owned_model_refusal",
     "_owned_running_state",
+    "_owned_vision_refusal",
     "_cleanup_owned_running",
 }
 methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in NAMES]
@@ -61,6 +63,7 @@ proof_class = next(
     if isinstance(n, ast.ClassDef) and n.name == "_WaitingCleanupProof"
 )
 namespace = dict(
+    inspect=inspect,
     Any=Any,
     Optional=Optional,
     dataclass=dataclass,
